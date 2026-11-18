@@ -43,7 +43,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, user_id INTEGER,
             gift_name TEXT, price_stars INTEGER, target_username TEXT,
             status TEXT DEFAULT 'draft', created_at TEXT, expires_at TEXT,
-            accepted_at TEXT, delivered_at TEXT, paid_at TEXT, proof TEXT, nft_link TEXT
+            accepted_at TEXT, delivered_at TEXT, paid_at TEXT, proof TEXT, nft_link TEXT, image_id TEXT
         );
         CREATE TABLE IF NOT EXISTS balances (user_id INTEGER PRIMARY KEY, stars INTEGER DEFAULT 0, updated_at TEXT);
         CREATE TABLE IF NOT EXISTS payouts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, username TEXT, txid TEXT, created_at TEXT);
@@ -72,11 +72,11 @@ def try_spend(uid, amount):
         c.execute("UPDATE balances SET stars=stars-?, updated_at=? WHERE user_id=?", (amount, now(), uid))
         c.commit(); return True
 
-def create_draft(admin_id, gift_name, price, target, nft_link):
+def create_draft(admin_id, gift_name, price, target, nft_link, image_id):
     expires = (datetime.utcnow() + timedelta(hours=OFFER_TTL_HOURS)).isoformat()
     with db() as c:
-        return c.execute("INSERT INTO offers(admin_id,user_id,gift_name,price_stars,target_username,status,created_at,expires_at,nft_link) VALUES (?,?,?,?,?,'draft',?,?,?)",
-                         (admin_id, None, gift_name, price, target, now(), expires, nft_link)).lastrowid
+        return c.execute("INSERT INTO offers(admin_id,user_id,gift_name,price_stars,target_username,status,created_at,expires_at,nft_link,image_id) VALUES (?,?,?,?,?,'draft',?,?,?,?)",
+                         (admin_id, None, gift_name, price, target, now(), expires, nft_link, image_id)).lastrowid
 
 def get_offer(oid):
     with db() as c: return c.execute("SELECT * FROM offers WHERE id=?", (oid,)).fetchone()
@@ -104,7 +104,7 @@ def save_payout(uid, amount, username, txid):
 
 # ================= FSM & HELPERS =================
 class AdminFlow(StatesGroup):
-    nft_link = State(); gift_name = State(); price = State(); target = State(); confirm = State()
+    nft_link = State(); gift_name = State(); price = State(); target = State(); image = State(); confirm = State()
 class UserFlow(StatesGroup):
     proof = State()
 class WdFlow(StatesGroup):
@@ -135,19 +135,14 @@ def kb_menu(uid):
         [InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")],
     ])
 
-# ================= ГЕНЕРАЦИЯ КАРТИНКИ =================
-async def generate_offer_image(offer_row):
+# ================= ГЕНЕРАЦИЯ КАРТИНКИ (своя) =================
+async def generate_offer_image(offer_row, bot: Bot):
     try:
-        async with ClientSession() as session:
-            async with session.get(offer_row['nft_link']) as resp:
-                html = await resp.text()
-                match = re.search(r'<meta property="og:image" content="(.*?)"', html)
-                if not match: raise ValueError("Нет картинки")
-                img_url = match.group(1)
-            async with session.get(img_url) as resp:
-                gift_data = await resp.read()
+        # Скачиваем картинку по file_id, который ты скинул
+        file_info = await bot.get_file(offer_row['image_id'])
+        file_bytes = await bot.download_file(file_info.file_path)
         
-        gift_img = Image.open(io.BytesIO(gift_data)).convert("RGBA")
+        gift_img = Image.open(io.BytesIO(file_bytes.read())).convert("RGBA")
         
         W, H = 800, 1000
         bg = Image.new("RGBA", (W, H), (0, 0, 0, 255))
@@ -324,7 +319,7 @@ async def adm_start(m: Message):
 async def adm_offer(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.set_state(AdminFlow.nft_link)
-    await m.answer("1/4. Скинь <b>ссылку на NFT</b> (например: https://t.me/nft/PlushPepe-112):")
+    await m.answer("1/5. Скинь <b>ссылку на NFT</b> (например: https://t.me/nft/PlushPepe-112):")
 
 @adm.message(AdminFlow.nft_link)
 async def adm_link(m: Message, state: FSMContext):
@@ -333,14 +328,14 @@ async def adm_link(m: Message, state: FSMContext):
     if not link.startswith("http"): return await m.answer("Нужна ссылка.")
     await state.update_data(nft_link=link)
     await state.set_state(AdminFlow.gift_name)
-    await m.answer("2/4. Введи <b>точное название</b> (например, Fine Pen #28,596):")
+    await m.answer("2/5. Введи <b>точное название</b> (например, Fine Pen #28,596):")
 
 @adm.message(AdminFlow.gift_name)
 async def adm_g(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.update_data(gift_name=m.text.strip()[:128])
     await state.set_state(AdminFlow.price)
-    await m.answer("3/4. Сколько <b>звёзд</b> предлагаем?")
+    await m.answer("3/5. Сколько <b>звёзд</b> предлагаем?")
 
 @adm.message(AdminFlow.price)
 async def adm_p(m: Message, state: FSMContext):
@@ -348,7 +343,7 @@ async def adm_p(m: Message, state: FSMContext):
     if not m.text.strip().isdigit(): return await m.answer("Введите число.")
     await state.update_data(price=int(m.text.strip()))
     await state.set_state(AdminFlow.target)
-    await m.answer("4/4. @username получателя подарка:")
+    await m.answer("4/5. @username получателя подарка:")
 
 @adm.message(AdminFlow.target)
 async def adm_t(m: Message, state: FSMContext):
@@ -356,9 +351,22 @@ async def adm_t(m: Message, state: FSMContext):
     u = norm_u(m.text)
     if not u: return await m.answer("Формат @username.")
     await state.update_data(target=u)
+    await state.set_state(AdminFlow.image)
+    await m.answer("5/5. Скинь <b>картинку подарка</b> (фото):")
+
+@adm.message(AdminFlow.image, F.photo)
+async def adm_img(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
+    file_id = m.photo[-1].file_id
+    await state.update_data(image_id=file_id)
     d = await state.get_data()
     await state.set_state(AdminFlow.confirm)
     await m.answer(f"Проверка:\nПодарок: <b>{d['gift_name']}</b>\nЦена: <b>{d['price']} ⭐</b>\nПолучатель: <b>{d['target']}</b>\n\nОтправить? /yes или /no")
+
+@adm.message(AdminFlow.image)
+async def adm_img_err(m: Message):
+    if not is_admin(m.from_user.id): return
+    await m.answer("Нужно отправить именно фото подарка.")
 
 @adm.message(Command("yes"))
 async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
@@ -366,7 +374,7 @@ async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
     d = await state.get_data(); await state.clear()
     if not d.get("gift_name"): return await m.answer("Нет данных.")
     
-    oid = create_draft(m.from_user.id, d["gift_name"], d["price"], d["target"], d["nft_link"])
+    oid = create_draft(m.from_user.id, d["gift_name"], d["price"], d["target"], d["nft_link"], d["image_id"])
     o = get_offer(oid)
     link = f"https://t.me/{SHOP_USERNAME}?start=o_{oid}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -374,7 +382,8 @@ async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
          InlineKeyboardButton(text="✅ Принять", url=link)]
     ])
     
-    img_buffer = await generate_offer_image(o)
+    # Теперь картинка генерируется из того фото, что ты скинул
+    img_buffer = await generate_offer_image(o, shop_bot)
     
     if img_buffer:
         photo = BufferedInputFile(img_buffer.read(), filename="offer.png")
