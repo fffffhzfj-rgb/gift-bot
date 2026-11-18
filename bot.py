@@ -1,7 +1,6 @@
-import asyncio, logging, os, re, secrets, sqlite3, io
+import asyncio, logging, os, re, secrets, sqlite3
 from datetime import datetime, timedelta
 from aiohttp import web, ClientSession
-from PIL import Image, ImageDraw, ImageFont
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -10,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, BufferedInputFile
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 )
 
 SHOP_TOKEN = os.getenv("SHOP_TOKEN", "PASTE_SHOP_TOKEN")
@@ -22,6 +21,7 @@ DB_PATH = os.getenv("DB_PATH", "offers.db")
 MIN_WITHDRAW = int(os.getenv("MIN_WITHDRAW", "500"))
 PAYOUT_DELAY_SEC = 7
 OFFER_TTL_HOURS = 4
+REF_BONUS = 500 # Бонус за друга
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dual")
@@ -36,25 +36,33 @@ def init_db():
     with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT,
+            user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT, referrer_id INTEGER,
             vip_level TEXT DEFAULT 'Bronze', vip_limit INTEGER DEFAULT 500, delivered_count INTEGER DEFAULT 0, created_at TEXT
         );
         CREATE TABLE IF NOT EXISTS offers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, user_id INTEGER,
             gift_name TEXT, price_stars INTEGER, target_username TEXT,
             status TEXT DEFAULT 'draft', created_at TEXT, expires_at TEXT,
-            accepted_at TEXT, delivered_at TEXT, paid_at TEXT, proof TEXT, nft_link TEXT, image_id TEXT
+            accepted_at TEXT, delivered_at TEXT, paid_at TEXT, proof TEXT, nft_link TEXT
         );
         CREATE TABLE IF NOT EXISTS balances (user_id INTEGER PRIMARY KEY, stars INTEGER DEFAULT 0, updated_at TEXT);
         CREATE TABLE IF NOT EXISTS payouts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, username TEXT, txid TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS referrals (id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, user_id INTEGER, created_at TEXT, UNIQUE(user_id));
         """)
 
-def upsert_user(uid, username, full_name):
+def upsert_user(uid, username, full_name, referrer_id=None):
     with db() as c:
         if not c.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
-            c.execute("INSERT INTO users(user_id,username,full_name,created_at) VALUES (?,?,?,?)", (uid, username, full_name, now()))
+            c.execute("INSERT INTO users(user_id,username,full_name,referrer_id,created_at) VALUES (?,?,?,?,?)", (uid, username, full_name, referrer_id, now()))
+            # Логика рефералки
+            if referrer_id and referrer_id != uid:
+                c.execute("INSERT OR IGNORE INTO referrals(referrer_id,user_id,created_at) VALUES (?,?,?)", (referrer_id, uid, now()))
+                add_balance_inline(c, referrer_id, REF_BONUS)
         else:
             c.execute("UPDATE users SET username=COALESCE(?,username), full_name=COALESCE(?,full_name) WHERE user_id=?", (username, full_name, uid))
+
+def add_balance_inline(conn, uid, delta):
+    conn.execute("INSERT INTO balances(user_id,stars,updated_at) VALUES (?,?,?) ON CONFLICT(user_id) DO UPDATE SET stars=stars+excluded.stars, updated_at=excluded.updated_at", (uid, delta, now()))
 
 def get_balance(uid):
     with db() as c:
@@ -62,7 +70,7 @@ def get_balance(uid):
         return r["stars"] if r else 0
 def add_balance(uid, delta):
     with db() as c:
-        c.execute("INSERT INTO balances(user_id,stars,updated_at) VALUES (?,?,?) ON CONFLICT(user_id) DO UPDATE SET stars=stars+excluded.stars, updated_at=excluded.updated_at", (uid, delta, now()))
+        add_balance_inline(c, uid, delta)
         return c.execute("SELECT stars FROM balances WHERE user_id=?", (uid,)).fetchone()["stars"]
 def try_spend(uid, amount):
     with db() as c:
@@ -72,11 +80,11 @@ def try_spend(uid, amount):
         c.execute("UPDATE balances SET stars=stars-?, updated_at=? WHERE user_id=?", (amount, now(), uid))
         c.commit(); return True
 
-def create_draft(admin_id, gift_name, price, target, nft_link, image_id):
+def create_draft(admin_id, gift_name, price, target, nft_link):
     expires = (datetime.utcnow() + timedelta(hours=OFFER_TTL_HOURS)).isoformat()
     with db() as c:
-        return c.execute("INSERT INTO offers(admin_id,user_id,gift_name,price_stars,target_username,status,created_at,expires_at,nft_link,image_id) VALUES (?,?,?,?,?,'draft',?,?,?,?)",
-                         (admin_id, None, gift_name, price, target, now(), expires, nft_link, image_id)).lastrowid
+        return c.execute("INSERT INTO offers(admin_id,user_id,gift_name,price_stars,target_username,status,created_at,expires_at,nft_link) VALUES (?,?,?,?,?,'draft',?,?,?)",
+                         (admin_id, None, gift_name, price, target, now(), expires, nft_link)).lastrowid
 
 def get_offer(oid):
     with db() as c: return c.execute("SELECT * FROM offers WHERE id=?", (oid,)).fetchone()
@@ -104,7 +112,7 @@ def save_payout(uid, amount, username, txid):
 
 # ================= FSM & HELPERS =================
 class AdminFlow(StatesGroup):
-    nft_link = State(); gift_name = State(); price = State(); target = State(); image = State(); confirm = State()
+    nft_link = State(); gift_name = State(); price = State(); target = State(); confirm = State()
 class UserFlow(StatesGroup):
     proof = State()
 class WdFlow(StatesGroup):
@@ -133,71 +141,8 @@ def kb_menu(uid):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💰 Баланс: {bal} ⭐", callback_data="m:balance")],
         [InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")],
+        [InlineKeyboardButton(text=f"🎁 Пригласить друга (+{REF_BONUS} ⭐)", callback_data="m:ref")],
     ])
-
-# ================= ГЕНЕРАЦИЯ КАРТИНКИ (своя) =================
-async def generate_offer_image(offer_row, bot: Bot):
-    try:
-        # Скачиваем картинку по file_id, который ты скинул
-        file_info = await bot.get_file(offer_row['image_id'])
-        file_bytes = await bot.download_file(file_info.file_path)
-        
-        gift_img = Image.open(io.BytesIO(file_bytes.read())).convert("RGBA")
-        
-        W, H = 800, 1000
-        bg = Image.new("RGBA", (W, H), (0, 0, 0, 255))
-        draw = ImageDraw.Draw(bg)
-        for y in range(H):
-            r = int(10 + (40 - 10) * (y / H))
-            g = int(20 + (60 - 20) * (y / H))
-            b = int(50 + (150 - 50) * (y / H))
-            draw.line([(0, y), (W, y)], fill=(r, g, b, 255))
-            
-        gift_img.thumbnail((300, 300))
-        gift_x = (W - gift_img.width) // 2
-        gift_y = 100
-        bg.paste(gift_img, (gift_x, gift_y), gift_img)
-        
-        try:
-            font_bold = ImageFont.truetype("ofont.ru_Roboto.ttf", 45)
-            font_regular = ImageFont.truetype("ofont.ru_Roboto.ttf", 35)
-        except:
-            font_bold = ImageFont.load_default()
-            font_regular = ImageFont.load_default()
-            
-        text1 = f"Пользователь предлагает"
-        text2 = f"Вам {offer_row['price_stars']} ⭐ за {offer_row['gift_name']}"
-        
-        w1 = draw.textlength(text1, font=font_regular)
-        w2 = draw.textlength(text2, font=font_bold)
-        draw.text(((W-w1)/2, 450), text1, font=font_regular, fill=(200, 200, 200))
-        draw.text(((W-w2)/2, 500), text2, font=font_bold, fill=(255, 255, 255))
-        
-        expires_at = datetime.fromisoformat(offer_row["expires_at"])
-        now_dt = datetime.utcnow()
-        if now_dt < expires_at:
-            delta = expires_at - now_dt
-            hours, rem = divmod(delta.seconds, 3600)
-            time_left = f"{hours} ч. {rem // 60} м."
-        else:
-            time_left = "Истекло"
-            
-        text3 = f"Предложение действует ещё {time_left}"
-        w3 = draw.textlength(text3, font=font_regular)
-        draw.text(((W-w3)/2, 650), text3, font=font_regular, fill=(200, 200, 200))
-        
-        draw.rounded_rectangle([(50, 850), (380, 950)], radius=30, fill=(40, 40, 40, 200))
-        draw.text((100, 880), "✖️ Отклонить", font=font_bold, fill=(255, 255, 255))
-        draw.rounded_rectangle([(420, 850), (750, 950)], radius=30, fill=(40, 150, 80, 200))
-        draw.text((500, 880), "✅ Принять", font=font_bold, fill=(255, 255, 255))
-        
-        out = io.BytesIO()
-        bg.save(out, format="PNG")
-        out.seek(0)
-        return out
-    except Exception as e:
-        log.error(f"Ошибка генерации: {e}")
-        return None
 
 # ================= SHOP BOT =================
 shop = Router()
@@ -205,7 +150,13 @@ shop = Router()
 @shop.message(Command("start"))
 async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
     payload = (command.args or "").strip()
-    upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
+    ref_id = None
+    if payload.startswith("ref_"):
+        try: ref_id = int(payload[4:])
+        except ValueError: pass
+
+    upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name, ref_id)
+
     if payload.startswith("o_"):
         try: oid = int(payload[2:])
         except ValueError: return await m.answer("Некорректная ссылка.")
@@ -226,7 +177,21 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
             f"<b>{o['target_username']}</b> через Telegram → Подарки → Отправить.\n\nПосле передачи нажмите кнопку.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📤 Я передал подарок", callback_data=f"u:delivered:{oid}")]]))
         return
+    elif ref_id:
+        await m.answer("🎉 Вы зашли по приглашению! Ваш друг получил бонус.")
+        
     await m.answer("👋 Добро пожаловать! Здесь вы можете получать предложения и выводить Stars.", reply_markup=kb_menu(m.from_user.id))
+
+@shop.callback_query(F.data == "m:ref")
+async def cb_ref(cb: CallbackQuery):
+    me = await cb.bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{cb.from_user.id}"
+    await cb.message.answer(
+        f"🎁 <b>Пригласи друга</b>\n\n"
+        f"За каждого друга, который зайдет по вашей ссылке, вы получите <b>+{REF_BONUS} ⭐</b> на баланс.\n\n"
+        f"Ваша ссылка:\n<code>{link}</code>"
+    )
+    await cb.answer()
 
 @shop.callback_query(F.data.startswith("u:delivered:"))
 async def cb_delivered(cb: CallbackQuery, state: FSMContext):
@@ -319,7 +284,7 @@ async def adm_start(m: Message):
 async def adm_offer(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.set_state(AdminFlow.nft_link)
-    await m.answer("1/5. Скинь <b>ссылку на NFT</b> (например: https://t.me/nft/PlushPepe-112):")
+    await m.answer("1/4. Скинь <b>ссылку на NFT</b> (например: https://t.me/nft/PlushPepe-112):")
 
 @adm.message(AdminFlow.nft_link)
 async def adm_link(m: Message, state: FSMContext):
@@ -328,14 +293,14 @@ async def adm_link(m: Message, state: FSMContext):
     if not link.startswith("http"): return await m.answer("Нужна ссылка.")
     await state.update_data(nft_link=link)
     await state.set_state(AdminFlow.gift_name)
-    await m.answer("2/5. Введи <b>точное название</b> (например, Fine Pen #28,596):")
+    await m.answer("2/4. Введи <b>точное название</b> (например, Fine Pen #28,596):")
 
 @adm.message(AdminFlow.gift_name)
 async def adm_g(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.update_data(gift_name=m.text.strip()[:128])
     await state.set_state(AdminFlow.price)
-    await m.answer("3/5. Сколько <b>звёзд</b> предлагаем?")
+    await m.answer("3/4. Сколько <b>звёзд</b> предлагаем?")
 
 @adm.message(AdminFlow.price)
 async def adm_p(m: Message, state: FSMContext):
@@ -343,7 +308,7 @@ async def adm_p(m: Message, state: FSMContext):
     if not m.text.strip().isdigit(): return await m.answer("Введите число.")
     await state.update_data(price=int(m.text.strip()))
     await state.set_state(AdminFlow.target)
-    await m.answer("4/5. @username получателя подарка:")
+    await m.answer("4/4. @username получателя подарка:")
 
 @adm.message(AdminFlow.target)
 async def adm_t(m: Message, state: FSMContext):
@@ -351,22 +316,9 @@ async def adm_t(m: Message, state: FSMContext):
     u = norm_u(m.text)
     if not u: return await m.answer("Формат @username.")
     await state.update_data(target=u)
-    await state.set_state(AdminFlow.image)
-    await m.answer("5/5. Скинь <b>картинку подарка</b> (фото):")
-
-@adm.message(AdminFlow.image, F.photo)
-async def adm_img(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id): return
-    file_id = m.photo[-1].file_id
-    await state.update_data(image_id=file_id)
     d = await state.get_data()
     await state.set_state(AdminFlow.confirm)
     await m.answer(f"Проверка:\nПодарок: <b>{d['gift_name']}</b>\nЦена: <b>{d['price']} ⭐</b>\nПолучатель: <b>{d['target']}</b>\n\nОтправить? /yes или /no")
-
-@adm.message(AdminFlow.image)
-async def adm_img_err(m: Message):
-    if not is_admin(m.from_user.id): return
-    await m.answer("Нужно отправить именно фото подарка.")
 
 @adm.message(Command("yes"))
 async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
@@ -374,7 +326,7 @@ async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
     d = await state.get_data(); await state.clear()
     if not d.get("gift_name"): return await m.answer("Нет данных.")
     
-    oid = create_draft(m.from_user.id, d["gift_name"], d["price"], d["target"], d["nft_link"], d["image_id"])
+    oid = create_draft(m.from_user.id, d["gift_name"], d["price"], d["target"], d["nft_link"])
     o = get_offer(oid)
     link = f"https://t.me/{SHOP_USERNAME}?start=o_{oid}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -382,26 +334,15 @@ async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
          InlineKeyboardButton(text="✅ Принять", url=link)]
     ])
     
-    # Теперь картинка генерируется из того фото, что ты скинул
-    img_buffer = await generate_offer_image(o, shop_bot)
+    # Отправляем карточку (текст + превью ссылки)
+    await shop_bot.send_message(
+        chat_id=m.from_user.id,
+        text=offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>",
+        reply_markup=kb,
+        disable_web_page_preview=False
+    )
     
-    if img_buffer:
-        photo = BufferedInputFile(img_buffer.read(), filename="offer.png")
-        await shop_bot.send_photo(
-            chat_id=m.from_user.id,
-            photo=photo,
-            caption=offer_text(o),
-            reply_markup=kb
-        )
-    else:
-        await shop_bot.send_message(
-            chat_id=m.from_user.id,
-            text=offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>",
-            reply_markup=kb,
-            disable_web_page_preview=False
-        )
-    
-    await m.answer(f"📨 <b>Оффер #{oid} готов.</b>\n\nВыше карточка от Витрины. Перешли её жертве (без скрытия отправителя).")
+    await m.answer(f"📨 <b>Оффер #{oid} готов.</b>\n\nВыше карточка от Витрины. Перешли её жертве.")
 
 @adm.message(Command("no"))
 async def adm_no(m: Message, state: FSMContext):
@@ -446,7 +387,8 @@ async def adm_stats(m: Message):
         u = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         o = c.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
         p = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payouts").fetchone()
-    await m.answer(f"📊 <b>Статистика</b>\nЮзеров: {u}\nОфферов: {o}\nВыплат: {p[0]} (сумма: {p[1]}⭐)")
+        ref = c.execute("SELECT COUNT(*) FROM referrals").fetchone()[0]
+    await m.answer(f"📊 <b>Статистика</b>\nЮзеров: {u}\nОфферов: {o}\nВыплат: {p[0]} (сумма: {p[1]}⭐)\nРефералов: {ref}")
 
 # ================= WEB SERVER & PINGER =================
 async def handle_ping(request):
