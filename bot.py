@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, BotCommand
 )
 
 SHOP_TOKEN = os.getenv("SHOP_TOKEN", "PASTE_SHOP_TOKEN")
@@ -51,13 +51,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS payouts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, username TEXT, txid TEXT, created_at TEXT);
         CREATE TABLE IF NOT EXISTS referrals (id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, user_id INTEGER, created_at TEXT, UNIQUE(user_id));
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-        
         CREATE TABLE IF NOT EXISTS pending_referrals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            referrer_id INTEGER,
-            ref_id INTEGER,
-            release_at TEXT,
-            status TEXT DEFAULT 'pending'
+            id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, ref_id INTEGER, release_at TEXT, status TEXT DEFAULT 'pending'
         );
         """)
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdraw', ?)", (str(DEFAULT_MIN_WITHDRAW),))
@@ -356,7 +351,18 @@ adm = Router()
 async def adm_start(m: Message):
     if not is_admin(m.from_user.id): return
     await m.answer(
-        "🛠 <b>Админ-панель</b>",
+        "🛠 <b>Админ-панель</b>\n\n"
+        "<b>Доступные команды:</b>\n"
+        "/offer — создать новый оффер\n"
+        "/users — список последних юзеров\n"
+        "/find &lt;@username или ID&gt; — найти юзера\n"
+        "/user &lt;id&gt; — карточка юзера\n"
+        "/addbal &lt;id&gt; &lt;сумма&gt; — начислить баланс\n"
+        "/deloffers &lt;draft|id&gt; — удалить офферы\n"
+        "/setmin &lt;сумма&gt; — изменить лимит вывода\n"
+        "/cleanup — удалить отработанные офферы\n"
+        "/broadcast &lt;текст&gt; — рассылка всем\n"
+        "/stats — статистика",
         reply_markup=kb_admin_panel()
     )
 
@@ -416,7 +422,7 @@ async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
     ])
     
     await shop_bot.send_message(
-        chat_id=m.from_user.id,
+         chat_id=m.from_user.id,
         text=offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>",
         reply_markup=kb,
         disable_web_page_preview=False
@@ -433,7 +439,6 @@ async def adm_no(m: Message, state: FSMContext):
 async def adm_cleanup(m: Message):
     if not is_admin(m.from_user.id): return
     with db() as c:
-        # Удаляем всё, что не draft и не pending
         res = c.execute("DELETE FROM offers WHERE status IN ('paid', 'declined', 'cancelled', 'delivered')")
         await m.answer(f"✅ База очищена. Удалено отработанных офферов: {res.rowcount}")
 
@@ -607,10 +612,28 @@ async def self_ping(url):
         except Exception as e:
             log.error(f"Ping error: {e}")
 
+async def set_commands(bot: Bot, commands: list):
+    await bot.set_my_commands(commands)
+
 async def main():
     init_db()
     shop_bot = Bot(SHOP_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     adm_bot = Bot(ADMIN_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+    # Устанавливаем нативное меню команд
+    await shop_bot.set_my_commands([
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="support", description="Поддержка"),
+    ])
+    
+    await adm_bot.set_my_commands([
+        BotCommand(command="start", description="Админ-панель"),
+        BotCommand(command="offer", description="Создать оффер"),
+        BotCommand(command="stats", description="Статистика"),
+        BotCommand(command="cleanup", description="Очистить отработанные офферы"),
+        BotCommand(command="users", description="Список юзеров"),
+        BotCommand(command="broadcast", description="Рассылка всем"),
+    ])
 
     shop_dp = Dispatcher(storage=MemoryStorage())
     shop_dp.include_router(shop)
