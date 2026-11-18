@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, FSInputFile, URLInputFile
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 )
 
 SHOP_TOKEN = os.getenv("SHOP_TOKEN", "PASTE_SHOP_TOKEN")
@@ -316,27 +316,10 @@ async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
          InlineKeyboardButton(text="✅ Принять", url=link)]
     ])
     
-    # Пытаемся скачать картинку из превью NFT
-    photo_url = None
-    # В Telegram Bot API нет прямого способа получить обложку NFT, поэтому 
-    # мы попробуем взять картинку с публичного CDN Fragment (упрощенно).
-    # Если ссылка на t.me/nft, мы формируем запрос к Telegram, чтобы он подтянул превью.
-    # Но проще всего отправить как медиа-группу или использовать ссылку на изображение.
-    # Пока будем использовать отправку текста, но с явной картинкой, если это возможно.
-    
-    # В качестве обходного пути, попробуем отправить ссылку на NFT как обычное сообщение
-    # с включенным превью (как на скрине). Увы, бот не может скачать картинку из t.me/nft напрямую.
-    
+    # ОТПРАВЛЯЕМ ОДНО СООБЩЕНИЕ С ТЕКСТОМ И ПРЕВЬЮ
     await shop_bot.send_message(
         chat_id=m.from_user.id,
-        text=offer_text(o),
-        reply_markup=kb,
-        disable_web_page_preview=False, # Это заставит Telegram подтянуть большое превью, если оно есть
-    )
-    # Добавляем ссылку отдельно, чтобы она точно была в сообщении для превью
-    await shop_bot.send_message(
-        chat_id=m.from_user.id,
-        text=f"<a href='{o['nft_link']}'>Посмотреть NFT</a>",
+        text=offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>",
         reply_markup=kb,
         disable_web_page_preview=False
     )
