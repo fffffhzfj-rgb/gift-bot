@@ -146,7 +146,7 @@ def kb_menu(uid):
 shop = Router()
 
 @shop.message(Command("start"))
-async def shop_start(m: Message, command: CommandObject):
+async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
     payload = (command.args or "").strip()
     upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
     if payload.startswith("o_"):
@@ -160,7 +160,7 @@ async def shop_start(m: Message, command: CommandObject):
             if not claim_offer(oid, m.from_user.id):
                 return await m.answer("Оффер уже занят.")
             o = get_offer(oid)
-            try: await m.bot.send_message(o["admin_id"], f"🔔 Оффер #{oid} открыт: @{m.from_user.username or '—'}")
+            try: await adm_bot.send_message(o["admin_id"], f"🔔 Оффер #{oid} открыт: @{m.from_user.username or '—'}")
             except Exception: pass
         
         set_status(oid, "accepted")
@@ -181,7 +181,7 @@ async def cb_delivered(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 @shop.message(UserFlow.proof)
-async def receive_proof(m: Message, state: FSMContext):
+async def receive_proof(m: Message, state: FSMContext, adm_bot: Bot):
     d = await state.get_data(); oid = d.get("offer_id"); await state.clear()
     if not oid: return
     o = get_offer(oid)
@@ -195,13 +195,13 @@ async def receive_proof(m: Message, state: FSMContext):
         f"✅ Подтверждение принято.\n<b>{o['price_stars']} ⭐ Stars</b> зачислены на баланс.\n"
         f"Баланс: <b>{newbal} ⭐</b>", reply_markup=kb_menu(m.from_user.id))
     
-    # Отправляем скриншот админу
+    # Отправляем скриншот админу ЧЕРЕЗ ADMIN BOT
     try:
-        await m.bot.send_message(o["admin_id"], f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})")
+        await adm_bot.send_message(o["admin_id"], f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})")
         if m.photo:
-            await m.bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=f"Скриншот к офферу #{oid}")
+            await adm_bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=f"Скриншот к офферу #{oid}")
         elif m.document:
-            await m.bot.send_document(o["admin_id"], m.document.file_id, caption=f"Файл к офферу #{oid}")
+            await adm_bot.send_document(o["admin_id"], m.document.file_id, caption=f"Файл к офферу #{oid}")
     except Exception as e: log.error(f"Не удалось переслать скрин: {e}")
 
 @shop.callback_query(F.data == "m:balance")
@@ -384,6 +384,11 @@ async def main():
     shop_dp.include_router(shop)
     adm_dp = Dispatcher(storage=MemoryStorage())
     adm_dp.include_router(adm)
+
+    # Передаем admin_bot внутрь shop_dp, чтобы витрина могла слать скрины в пульт
+    shop_dp["adm_bot"] = adm_bot
+    adm_dp["adm_bot"] = adm_bot
+    shop_dp["shop_bot"] = shop_bot
 
     app = web.Application()
     app.router.add_get('/', handle_ping)
