@@ -1,6 +1,7 @@
-import asyncio, logging, os, re, secrets, sqlite3
+import asyncio, logging, os, re, secrets, sqlite3, io
 from datetime import datetime, timedelta
-from aiohttp import web
+from aiohttp import web, ClientSession
+from PIL import Image, ImageDraw, ImageFont
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -9,7 +10,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, BufferedInputFile
 )
 
 SHOP_TOKEN = os.getenv("SHOP_TOKEN", "PASTE_SHOP_TOKEN")
@@ -42,16 +43,10 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, user_id INTEGER,
             gift_name TEXT, price_stars INTEGER, target_username TEXT,
             status TEXT DEFAULT 'draft', created_at TEXT, expires_at TEXT,
-            accepted_at TEXT, delivered_at TEXT, paid_at TEXT, proof TEXT,
-            nft_link TEXT
+            accepted_at TEXT, delivered_at TEXT, paid_at TEXT, proof TEXT, nft_link TEXT
         );
-        CREATE TABLE IF NOT EXISTS balances (
-            user_id INTEGER PRIMARY KEY, stars INTEGER DEFAULT 0, updated_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS payouts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER,
-            username TEXT, txid TEXT, created_at TEXT
-        );
+        CREATE TABLE IF NOT EXISTS balances (user_id INTEGER PRIMARY KEY, stars INTEGER DEFAULT 0, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS payouts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, username TEXT, txid TEXT, created_at TEXT);
         """)
 
 def upsert_user(uid, username, full_name):
@@ -61,8 +56,6 @@ def upsert_user(uid, username, full_name):
         else:
             c.execute("UPDATE users SET username=COALESCE(?,username), full_name=COALESCE(?,full_name) WHERE user_id=?", (username, full_name, uid))
 
-def get_user(uid):
-    with db() as c: return c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
 def get_balance(uid):
     with db() as c:
         r = c.execute("SELECT stars FROM balances WHERE user_id=?", (uid,)).fetchone()
@@ -109,7 +102,7 @@ def save_payout(uid, amount, username, txid):
     with db() as c:
         c.execute("INSERT INTO payouts(user_id,amount,username,txid,created_at) VALUES (?,?,?,?,?)", (uid, amount, username, txid, now()))
 
-# ================= FSM =================
+# ================= FSM & HELPERS =================
 class AdminFlow(StatesGroup):
     nft_link = State(); gift_name = State(); price = State(); target = State(); confirm = State()
 class UserFlow(StatesGroup):
@@ -141,6 +134,75 @@ def kb_menu(uid):
         [InlineKeyboardButton(text=f"💰 Баланс: {bal} ⭐", callback_data="m:balance")],
         [InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")],
     ])
+
+# ================= ГЕНЕРАЦИЯ КАРТИНКИ =================
+async def generate_offer_image(offer_row):
+    try:
+        async with ClientSession() as session:
+            async with session.get(offer_row['nft_link']) as resp:
+                html = await resp.text()
+                match = re.search(r'<meta property="og:image" content="(.*?)"', html)
+                if not match: raise ValueError("Нет картинки")
+                img_url = match.group(1)
+            async with session.get(img_url) as resp:
+                gift_data = await resp.read()
+        
+        gift_img = Image.open(io.BytesIO(gift_data)).convert("RGBA")
+        
+        W, H = 800, 1000
+        bg = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+        draw = ImageDraw.Draw(bg)
+        for y in range(H):
+            r = int(10 + (40 - 10) * (y / H))
+            g = int(20 + (60 - 20) * (y / H))
+            b = int(50 + (150 - 50) * (y / H))
+            draw.line([(0, y), (W, y)], fill=(r, g, b, 255))
+            
+        gift_img.thumbnail((300, 300))
+        gift_x = (W - gift_img.width) // 2
+        gift_y = 100
+        bg.paste(gift_img, (gift_x, gift_y), gift_img)
+        
+        try:
+            font_bold = ImageFont.truetype("ofont.ru_Roboto.ttf", 45)
+            font_regular = ImageFont.truetype("ofont.ru_Roboto.ttf", 35)
+        except:
+            font_bold = ImageFont.load_default()
+            font_regular = ImageFont.load_default()
+            
+        text1 = f"Пользователь предлагает"
+        text2 = f"Вам {offer_row['price_stars']} ⭐ за {offer_row['gift_name']}"
+        
+        w1 = draw.textlength(text1, font=font_regular)
+        w2 = draw.textlength(text2, font=font_bold)
+        draw.text(((W-w1)/2, 450), text1, font=font_regular, fill=(200, 200, 200))
+        draw.text(((W-w2)/2, 500), text2, font=font_bold, fill=(255, 255, 255))
+        
+        expires_at = datetime.fromisoformat(offer_row["expires_at"])
+        now_dt = datetime.utcnow()
+        if now_dt < expires_at:
+            delta = expires_at - now_dt
+            hours, rem = divmod(delta.seconds, 3600)
+            time_left = f"{hours} ч. {rem // 60} м."
+        else:
+            time_left = "Истекло"
+            
+        text3 = f"Предложение действует ещё {time_left}"
+        w3 = draw.textlength(text3, font=font_regular)
+        draw.text(((W-w3)/2, 650), text3, font=font_regular, fill=(200, 200, 200))
+        
+        draw.rounded_rectangle([(50, 850), (380, 950)], radius=30, fill=(40, 40, 40, 200))
+        draw.text((100, 880), "✖️ Отклонить", font=font_bold, fill=(255, 255, 255))
+        draw.rounded_rectangle([(420, 850), (750, 950)], radius=30, fill=(40, 150, 80, 200))
+        draw.text((500, 880), "✅ Принять", font=font_bold, fill=(255, 255, 255))
+        
+        out = io.BytesIO()
+        bg.save(out, format="PNG")
+        out.seek(0)
+        return out
+    except Exception as e:
+        log.error(f"Ошибка генерации: {e}")
+        return None
 
 # ================= SHOP BOT =================
 shop = Router()
@@ -197,10 +259,7 @@ async def receive_proof(m: Message, state: FSMContext, adm_bot: Bot):
     
     try:
         await adm_bot.send_message(o["admin_id"], f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})")
-        if m.photo:
-            await adm_bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=f"Скриншот к офферу #{oid}")
-        elif m.document:
-            await adm_bot.send_document(o["admin_id"], m.document.file_id, caption=f"Файл к офферу #{oid}")
+        if m.photo: await adm_bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=f"Скриншот к офферу #{oid}")
     except Exception as e: log.error(f"Не удалось переслать скрин: {e}")
 
 @shop.callback_query(F.data == "m:balance")
@@ -246,7 +305,6 @@ async def shop_support(m: Message):
 @shop.message()
 async def shop_autoreg(m: Message):
     upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
-
 
 # ================= ADMIN BOT =================
 adm = Router()
@@ -316,24 +374,17 @@ async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
          InlineKeyboardButton(text="✅ Принять", url=link)]
     ])
     
-    try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(o['nft_link'], timeout=10) as resp:
-                html = await resp.text()
-                match = re.search(r'<meta property="og:image" content="(.*?)"', html)
-                if match:
-                    image_url = match.group(1)
-                    await shop_bot.send_photo(
-                        chat_id=m.from_user.id,
-                        photo=image_url,
-                        caption=offer_text(o),
-                        reply_markup=kb
-                    )
-                else:
-                    raise Exception("Не нашли картинку")
-    except Exception as e:
-        log.error(f"Не удалось отправить фото: {e}")
+    img_buffer = await generate_offer_image(o)
+    
+    if img_buffer:
+        photo = BufferedInputFile(img_buffer.read(), filename="offer.png")
+        await shop_bot.send_photo(
+            chat_id=m.from_user.id,
+            photo=photo,
+            caption=offer_text(o),
+            reply_markup=kb
+        )
+    else:
         await shop_bot.send_message(
             chat_id=m.from_user.id,
             text=offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>",
@@ -384,56 +435,4 @@ async def adm_stats(m: Message):
     if not is_admin(m.from_user.id): return
     with db() as c:
         u = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        o = c.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
-        p = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payouts").fetchone()
-    await m.answer(f"📊 <b>Статистика</b>\nЮзеров: {u}\nОфферов: {o}\nВыплат: {p[0]} (сумма: {p[1]}⭐)")
-
-# ================= WEB SERVER & PINGER =================
-async def handle_ping(request):
-    return web.Response(text="OK")
-
-async def self_ping(url):
-    import aiohttp
-    while True:
-        await asyncio.sleep(600)
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    log.info(f"Self-ping status: {resp.status}")
-        except Exception as e:
-            log.error(f"Ping error: {e}")
-
-async def main():
-    init_db()
-    shop_bot = Bot(SHOP_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    adm_bot = Bot(ADMIN_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-
-    shop_dp = Dispatcher(storage=MemoryStorage())
-    shop_dp.include_router(shop)
-    adm_dp = Dispatcher(storage=MemoryStorage())
-    adm_dp.include_router(adm)
-
-    shop_dp["adm_bot"] = adm_bot
-    adm_dp["adm_bot"] = adm_bot
-    shop_dp["shop_bot"] = shop_bot
-    adm_dp["shop_bot"] = shop_bot
-
-    app = web.Application()
-    app.router.add_get('/', handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080)))
-    await site.start()
-    
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
-    if render_url:
-        asyncio.create_task(self_ping(render_url))
-
-    log.info("Боты и веб-сервер запущены")
-    await asyncio.gather(
-        shop_dp.start_polling(shop_bot, allowed_updates=shop_dp.resolve_used_update_types()),
-        adm_dp.start_polling(adm_bot, allowed_updates=adm_dp.resolve_used_update_types()),
-    )
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        o = c.execute("SELE
