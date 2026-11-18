@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, FSInputFile, URLInputFile
 )
 
 SHOP_TOKEN = os.getenv("SHOP_TOKEN", "PASTE_SHOP_TOKEN")
@@ -195,7 +195,6 @@ async def receive_proof(m: Message, state: FSMContext, adm_bot: Bot):
         f"✅ Подтверждение принято.\n<b>{o['price_stars']} ⭐ Stars</b> зачислены на баланс.\n"
         f"Баланс: <b>{newbal} ⭐</b>", reply_markup=kb_menu(m.from_user.id))
     
-    # Отправляем скриншот админу ЧЕРЕЗ ADMIN BOT
     try:
         await adm_bot.send_message(o["admin_id"], f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})")
         if m.photo:
@@ -304,16 +303,45 @@ async def adm_t(m: Message, state: FSMContext):
     await m.answer(f"Проверка:\nПодарок: <b>{d['gift_name']}</b>\nЦена: <b>{d['price']} ⭐</b>\nПолучатель: <b>{d['target']}</b>\n\nОтправить? /yes или /no")
 
 @adm.message(Command("yes"))
-async def adm_yes(m: Message, state: FSMContext):
+async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
     if not is_admin(m.from_user.id): return
     d = await state.get_data(); await state.clear()
     if not d.get("gift_name"): return await m.answer("Нет данных.")
+    
     oid = create_draft(m.from_user.id, d["gift_name"], d["price"], d["target"], d["nft_link"])
     o = get_offer(oid)
     link = f"https://t.me/{SHOP_USERNAME}?start=o_{oid}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Отклонить", url=f"https://t.me/{SHOP_USERNAME}"), InlineKeyboardButton(text="✅ Принять", url=link)]])
-    await m.answer(offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>", reply_markup=kb, disable_web_page_preview=False)
-    await m.answer(f"📨 <b>Оффер #{oid} готов.</b>\n\nПерешли карточку выше жертве.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✖️ Отклонить", url=f"https://t.me/{SHOP_USERNAME}"), 
+         InlineKeyboardButton(text="✅ Принять", url=link)]
+    ])
+    
+    # Пытаемся скачать картинку из превью NFT
+    photo_url = None
+    # В Telegram Bot API нет прямого способа получить обложку NFT, поэтому 
+    # мы попробуем взять картинку с публичного CDN Fragment (упрощенно).
+    # Если ссылка на t.me/nft, мы формируем запрос к Telegram, чтобы он подтянул превью.
+    # Но проще всего отправить как медиа-группу или использовать ссылку на изображение.
+    # Пока будем использовать отправку текста, но с явной картинкой, если это возможно.
+    
+    # В качестве обходного пути, попробуем отправить ссылку на NFT как обычное сообщение
+    # с включенным превью (как на скрине). Увы, бот не может скачать картинку из t.me/nft напрямую.
+    
+    await shop_bot.send_message(
+        chat_id=m.from_user.id,
+        text=offer_text(o),
+        reply_markup=kb,
+        disable_web_page_preview=False, # Это заставит Telegram подтянуть большое превью, если оно есть
+    )
+    # Добавляем ссылку отдельно, чтобы она точно была в сообщении для превью
+    await shop_bot.send_message(
+        chat_id=m.from_user.id,
+        text=f"<a href='{o['nft_link']}'>Посмотреть NFT</a>",
+        reply_markup=kb,
+        disable_web_page_preview=False
+    )
+    
+    await m.answer(f"📨 <b>Оффер #{oid} готов.</b>\n\nВыше карточка от Витрины. Перешли её жертве (без скрытия отправителя).")
 
 @adm.message(Command("no"))
 async def adm_no(m: Message, state: FSMContext):
@@ -367,7 +395,7 @@ async def handle_ping(request):
 async def self_ping(url):
     import aiohttp
     while True:
-        await asyncio.sleep(600) # 10 минут
+        await asyncio.sleep(600)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
@@ -385,10 +413,10 @@ async def main():
     adm_dp = Dispatcher(storage=MemoryStorage())
     adm_dp.include_router(adm)
 
-    # Передаем admin_bot внутрь shop_dp, чтобы витрина могла слать скрины в пульт
     shop_dp["adm_bot"] = adm_bot
     adm_dp["adm_bot"] = adm_bot
     shop_dp["shop_bot"] = shop_bot
+    adm_dp["shop_bot"] = shop_bot
 
     app = web.Application()
     app.router.add_get('/', handle_ping)
