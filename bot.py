@@ -435,4 +435,55 @@ async def adm_stats(m: Message):
     if not is_admin(m.from_user.id): return
     with db() as c:
         u = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        o = c.execute("SELE
+        o = c.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+        p = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payouts").fetchone()
+    await m.answer(f"📊 <b>Статистика</b>\nЮзеров: {u}\nОфферов: {o}\nВыплат: {p[0]} (сумма: {p[1]}⭐)")
+
+# ================= WEB SERVER & PINGER =================
+async def handle_ping(request):
+    return web.Response(text="OK")
+
+async def self_ping(url):
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with ClientSession() as session:
+                async with session.get(url) as resp:
+                    log.info(f"Self-ping status: {resp.status}")
+        except Exception as e:
+            log.error(f"Ping error: {e}")
+
+async def main():
+    init_db()
+    shop_bot = Bot(SHOP_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    adm_bot = Bot(ADMIN_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+    shop_dp = Dispatcher(storage=MemoryStorage())
+    shop_dp.include_router(shop)
+    adm_dp = Dispatcher(storage=MemoryStorage())
+    adm_dp.include_router(adm)
+
+    shop_dp["adm_bot"] = adm_bot
+    adm_dp["adm_bot"] = adm_bot
+    shop_dp["shop_bot"] = shop_bot
+    adm_dp["shop_bot"] = shop_bot
+
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080)))
+    await site.start()
+    
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    if render_url:
+        asyncio.create_task(self_ping(render_url))
+
+    log.info("Боты и веб-сервер запущены")
+    await asyncio.gather(
+        shop_dp.start_polling(shop_bot, allowed_updates=shop_dp.resolve_used_update_types()),
+        adm_dp.start_polling(adm_bot, allowed_updates=adm_dp.resolve_used_update_types()),
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())
