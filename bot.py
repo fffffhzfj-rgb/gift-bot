@@ -334,8 +334,7 @@ class PromoFlow(StatesGroup):
 class PremiumFlow(StatesGroup):
     username = State()
     months   = State()
-
-# ================= SHOP BOT =================
+    # ================= SHOP BOT =================
 shop = Router()
 
 @shop.message(Command("start"))
@@ -638,8 +637,7 @@ async def shop_support(m: Message):
 @shop.message()
 async def shop_autoreg(m: Message):
     upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
-
-# ================= ADMIN BOT =================
+    # ================= ADMIN BOT =================
 adm = Router()
 
 def adm_main_kb():
@@ -760,7 +758,6 @@ async def adm_yes(cb: CallbackQuery, state: FSMContext, shop_bot: Bot):
     text = offer_text(o)
     
     try:
-        # Отправляем карточку от лица витрины
         msg = await shop_bot.send_message(cb.from_user.id, text, disable_web_page_preview=False, parse_mode="HTML")
         await asyncio.sleep(0.5)
         await msg.edit_reply_markup(reply_markup=offer_kb(oid))
@@ -824,7 +821,6 @@ async def adm_addbal_amount(m: Message, state: FSMContext):
     try: await m.bot.send_message(uid, f"🎁 Вам начислен бонус!\nБаланс: {stars} ⭐ | {gram/1000:g} GRAM")
     except Exception: pass
 
-# --- Premium ---
 @adm.callback_query(F.data == "adm:grantprem")
 async def adm_btn_grantprem(cb: CallbackQuery, state: FSMContext):
     with db() as c:
@@ -896,7 +892,7 @@ async def adm_input_handler(m: Message, state: FSMContext):
 
 # ================= ПРОМО =================
 @adm.callback_query(F.data == "adm:promos")
-async def adm_btn_promos(cb: CallbackQuery): Я 
+async def adm_btn_promos(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Создать", callback_data="adm:promo_new")],
         [InlineKeyboardButton(text="📋 Список", callback_data="adm:promo_list")],
