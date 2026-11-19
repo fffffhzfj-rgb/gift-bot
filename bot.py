@@ -1,4 +1,4 @@
-import asyncio, logging, os, re, secrets, sqlite3
+import asyncio, logging, os, re, secrets, sqlite3, random, string
 from datetime import datetime, timedelta, timezone
 from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, F, Router
@@ -13,7 +13,7 @@ from aiogram.types import (
 )
 
 SHOP_TOKEN = os.getenv("SHOP_TOKEN", "PASTE_SHOP_TOKEN")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "PASTE_ADMIN_TOKEN")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "123").split(",") if x.strip().isdigit()}
 SHOP_USERNAME = os.getenv("SHOP_USERNAME", "your_shop_bot")
 SUPPORT = os.getenv("SUPPORT", "@your_support")
@@ -24,10 +24,12 @@ PAYOUT_DELAY_SEC = 7
 OFFER_TTL_HOURS = 6
 REF_BONUS = 500
 REF_HOLD_DAYS = 7
+USERS_PER_PAGE = 10
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dual")
 
+# ================= DB =================
 def db():
     c = sqlite3.connect(DB_PATH); c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL"); return c
@@ -42,7 +44,7 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS offers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, user_id INTEGER,
-            gift_name TEXT, price_stars REAL, currency TEXT DEFAULT 'stars', 
+            gift_name TEXT, price_stars REAL, currency TEXT DEFAULT 'stars',
             target_username TEXT, status TEXT DEFAULT 'draft', created_at TEXT, expires_at TEXT,
             accepted_at TEXT, delivered_at TEXT, paid_at TEXT, proof TEXT, nft_link TEXT
         );
@@ -50,7 +52,7 @@ def init_db():
             user_id INTEGER PRIMARY KEY, stars INTEGER DEFAULT 0, gram REAL DEFAULT 0, premium INTEGER DEFAULT 0, updated_at TEXT
         );
         CREATE TABLE IF NOT EXISTS payouts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, currency TEXT, 
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, currency TEXT,
             username TEXT, txid TEXT, created_at TEXT
         );
         CREATE TABLE IF NOT EXISTS referrals (id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, user_id INTEGER, created_at TEXT, UNIQUE(user_id));
@@ -85,7 +87,7 @@ def check_pending_referrals(uid):
         now_dt = datetime.now(timezone.utc).isoformat()
         ready = c.execute("SELECT * FROM pending_referrals WHERE referrer_id=? AND status='pending' AND release_at <= ?", (uid, now_dt)).fetchall()
         for r in ready:
-            add_balance(uid, 'stars', REF_BONUS)
+            add_balance_inline(c, uid, 'stars', REF_BONUS)
             c.execute("UPDATE pending_referrals SET status='paid' WHERE id=?", (r["id"],))
         return len(ready)
 
@@ -147,9 +149,12 @@ def save_payout(uid, amount, currency, username, txid):
     with db() as c:
         c.execute("INSERT INTO payouts(user_id,amount,currency,username,txid,created_at) VALUES (?,?,?,?,?,?)", (uid, amount, currency, username, txid, now()))
 
+# ================= FSM =================
 class AdminFlow(StatesGroup):
     nft_link = State(); gift_name = State(); price = State(); currency = State(); target = State(); confirm = State()
-    broadcast = State(); setmin = State(); addbal_id = State(); addbal_amount = State(); addbal_currency = State()
+    broadcast = State(); setmin = State()
+    addbal_search = State(); addbal_amount = State(); addbal_currency = State()
+    send_offer_user = State(); send_offer_link = State(); send_offer_name = State(); send_offer_price = State(); send_offer_curr = State(); send_offer_target = State()
 
 class UserFlow(StatesGroup):
     proof = State()
@@ -171,13 +176,13 @@ def offer_text(o):
         delta = expires_at - now_dt
         hours, rem = divmod(delta.seconds, 3600)
         time_left = f"{hours} ч. {rem // 60} м."
-    
+
     curr = o['currency']
     price_str = f"{o['price_stars']:g} ⭐" if curr == 'stars' else (f"{o['price_stars']:g} GRAM" if curr == 'gram' else f"{o['price_stars']:g} Premium")
-    
+
     return (
-        f"🎁 <b>Пользователь предлагает Вам {price_str} за {o['gift_name']}</b>\n\n"
-        f"Предложение действует ещё <b>{time_left}</b>"
+        f"Пользователь предлагает Вам {price_str} за {o['gift_name']}\n\n"
+        f"Предложение действует ещё {time_left}"
     )
 
 def kb_menu(uid):
@@ -186,19 +191,22 @@ def kb_menu(uid):
     bal_prem = get_balance(uid, 'premium')
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💰 Баланс: {bal_stars:g} ⭐ | {bal_gram:g} GRAM | {bal_prem:g} Prem", callback_data="m:balance")],
-        [InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")],
+        [InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw"), InlineKeyboardButton(text="📜 История", callback_data="m:hist")],
         [InlineKeyboardButton(text=f"🎁 Пригласить друга (+{REF_BONUS} ⭐)", callback_data="m:ref")],
-        [InlineKeyboardButton(text="🛟 Поддержка", url=f"https://t.me/{SUPPORT.replace('@','')}")]
+        [InlineKeyboardButton(text="🆔 Мой ID", callback_data="m:myid"), InlineKeyboardButton(text="🛟 Поддержка", url=f"https://t.me/{SUPPORT.replace('@','')}")]
     ])
 
 def kb_admin_panel():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎁 Создать оффер", callback_data="a:create_offer")],
+        [InlineKeyboardButton(text="📤 Отправить оффер юзеру", callback_data="a:send_offer")],
         [InlineKeyboardButton(text="👥 Юзеры", callback_data="a:users"), InlineKeyboardButton(text="📊 Статистика", callback_data="a:stats")],
         [InlineKeyboardButton(text="💰 Начислить баланс", callback_data="a:addbal"), InlineKeyboardButton(text="⚙️ Лимит вывода", callback_data="a:setmin")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="a:broadcast"), InlineKeyboardButton(text="🧹 Очистить мусор", callback_data="a:cleanup")],
+        [InlineKeyboardButton(text="🗂 Офферы по статусу", callback_data="a:offers_menu")],
     ])
 
+# ================= SHOP =================
 shop = Router()
 
 @shop.message(Command("start"))
@@ -228,7 +236,7 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
             o = get_offer(oid)
             try: await adm_bot.send_message(o["admin_id"], f"🔔 Оффер #{oid} открыт: @{m.from_user.username or '—'}")
             except Exception: pass
-        
+
         set_status(oid, "accepted")
         await m.answer(
             f"✅ Оффер принят.\n\nПередайте подарок <b>{o['gift_name']}</b> на "
@@ -237,39 +245,62 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
         return
     elif ref_id:
         await m.answer(f"🎉 Вы зашли по приглашению! Ваш друг получит +{REF_BONUS} ⭐ через {REF_HOLD_DAYS} дней.")
-        
+
     with db() as c:
         has_pending = c.execute("SELECT 1 FROM pending_referrals WHERE referrer_id=? AND status='pending' LIMIT 1", (m.from_user.id,)).fetchone()
-    
+
     kb_buttons = [
         [InlineKeyboardButton(text=f"💰 Баланс: {get_balance(m.from_user.id, 'stars')} ⭐", callback_data="m:balance")],
-        [InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")],
+        [InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw"), InlineKeyboardButton(text="📜 История", callback_data="m:hist")],
         [InlineKeyboardButton(text=f"🎁 Пригласить друга (+{REF_BONUS} ⭐)", callback_data="m:ref")],
-        [InlineKeyboardButton(text="🛟 Поддержка", url=f"https://t.me/{SUPPORT.replace('@','')}")]
+        [InlineKeyboardButton(text="🆔 Мой ID", callback_data="m:myid"), InlineKeyboardButton(text="🛟 Поддержка", url=f"https://t.me/{SUPPORT.replace('@','')}")]
     ]
     if has_pending:
         kb_buttons.insert(0, [InlineKeyboardButton(text="⏳ У вас есть ожидающие бонусы!", callback_data="m:ref")])
-        
+
     await m.answer("👋 Добро пожаловать! Здесь вы можете получать предложения и выводить средства.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
+
+@shop.callback_query(F.data == "m:myid")
+async def cb_myid(cb: CallbackQuery):
+    await cb.answer(f"Ваш ID: {cb.from_user.id}", show_alert=True)
+
+@shop.callback_query(F.data == "m:hist")
+async def cb_hist(cb: CallbackQuery):
+    with db() as c:
+        offers = c.execute("SELECT * FROM offers WHERE user_id=? ORDER BY id DESC LIMIT 10", (cb.from_user.id,)).fetchall()
+        payouts = c.execute("SELECT * FROM payouts WHERE user_id=? ORDER BY id DESC LIMIT 10", (cb.from_user.id,)).fetchall()
+    text = "📜 <b>История</b>\n\n"
+    if offers:
+        text += "<b>Офферы:</b>\n"
+        for o in offers:
+            text += f"• #{o['id']} {o['gift_name']} — {o['price_stars']:g} {o['currency'].upper()} [{o['status']}]\n"
+    if payouts:
+        text += "\n<b>Выплаты:</b>\n"
+        for p in payouts:
+            text += f"• {p['amount']:g} {p['currency'].upper()} на {p['username']} — <code>{p['txid'][:10]}…</code>\n"
+    if not offers and not payouts:
+        text += "Пусто."
+    await cb.message.answer(text)
+    await cb.answer()
 
 @shop.callback_query(F.data == "m:ref")
 async def cb_ref(cb: CallbackQuery):
     me = await cb.bot.get_me()
     link = f"https://t.me/{me.username}?start=ref_{cb.from_user.id}"
-    
+
     with db() as c:
         refs = c.execute("""
-            SELECT pr.*, u.username, u.full_name 
+            SELECT pr.*, u.username, u.full_name
             FROM pending_referrals pr
             LEFT JOIN users u ON u.user_id = pr.ref_id
             WHERE pr.referrer_id = ? AND pr.status = 'pending'
             ORDER BY pr.release_at ASC
         """, (cb.from_user.id,)).fetchall()
-    
+
     text = f"🎁 <b>Пригласи друга</b>\n\n"
     text += f"За каждого друга, который зайдет по вашей ссылке, вы получите <b>+{REF_BONUS} ⭐</b>.\n"
     text += f"<i>Бонус начисляется через {REF_HOLD_DAYS} дней после приглашения.</i>\n\n"
-    
+
     if refs:
         text += "👥 <b>Ваши друзья в ожидании:</b>\n"
         now_dt = datetime.now(timezone.utc)
@@ -282,9 +313,9 @@ async def cb_ref(cb: CallbackQuery):
             text += f"• {name} — осталось {days_left} д. {hours_left} ч.\n"
     else:
         text += "У вас пока нет приглашенных друзей в ожидании.\n\n"
-        
+
     text += f"\n🔗 Ваша ссылка:\n<code>{link}</code>"
-    
+
     await cb.message.answer(text)
     await cb.answer()
 
@@ -294,7 +325,7 @@ async def cb_delivered(cb: CallbackQuery, state: FSMContext):
     if not o or o["user_id"] != cb.from_user.id: return await cb.answer("Не ваш", show_alert=True)
     await state.update_data(offer_id=oid)
     await state.set_state(UserFlow.proof)
-    await cb.message.answer("📎 Пришлите скриншот/чек передачи подарка.")
+    await cb.message.answer("📎 Пришлите скриншот/чек/документ передачи подарка.")
     await cb.answer()
 
 @shop.message(UserFlow.proof)
@@ -303,20 +334,26 @@ async def receive_proof(m: Message, state: FSMContext, adm_bot: Bot):
     if not oid: return
     o = get_offer(oid)
     if not o or o["user_id"] != m.from_user.id: return await m.answer("Ошибка.")
-    
-    proof = m.text or (m.photo[-1].file_id if m.photo else "none")
+
+    proof = m.text or (m.photo[-1].file_id if m.photo else (m.document.file_id if m.document else "none"))
     set_status(oid, "paid", proof=proof)
     curr = o['currency']
     newbal = add_balance(o["user_id"], curr, o["price_stars"])
-    
+
     await m.answer(
         f"✅ Подтверждение принято.\n<b>{o['price_stars']:g} {curr.upper()}</b> зачислены на баланс.\n"
         f"Баланс: <b>{newbal:g} {curr.upper()}</b>", reply_markup=kb_menu(m.from_user.id))
-    
+
+    caption = f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})"
     try:
-        await adm_bot.send_message(o["admin_id"], f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})")
-        if m.photo: await adm_bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=f"Скриншот к офферу #{oid}")
-    except Exception as e: log.error(f"Не удалось переслать скрин: {e}")
+        if m.photo:
+            await adm_bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=caption)
+        elif m.document:
+            await adm_bot.send_document(o["admin_id"], m.document.file_id, caption=caption)
+        elif m.text:
+            await adm_bot.send_message(o["admin_id"], caption + f"\n\n<b>Текст:</b>\n{m.text}")
+    except Exception as e:
+        log.error(f"Не удалось переслать proof: {e}")
 
 @shop.callback_query(F.data == "m:balance")
 async def shop_balance(cb: CallbackQuery):
@@ -328,7 +365,7 @@ async def shop_balance(cb: CallbackQuery):
         f"💰 <b>Ваш баланс:</b>\n"
         f"⭐ Stars: {bal_s:g} (мин. {mw})\n"
         f"💎 GRAM: {bal_g:g}\n"
-        f"🌟 Premium: {bal_p:g} мес.\n", 
+        f"🌟 Premium: {bal_p:g} мес.\n",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")]]))
     await cb.answer()
 
@@ -347,12 +384,12 @@ async def wd_currency(cb: CallbackQuery, state: FSMContext):
     await state.update_data(currency=curr)
     bal = get_balance(cb.from_user.id, curr)
     mw = get_min_withdraw()
-    
-    if curr == 'stars' and bal < mw: 
+
+    if curr == 'stars' and bal < mw:
         return await cb.message.answer(f"⚠️ Минимум для вывода Stars — <b>{mw} ⭐</b>. У вас: <b>{bal:g}</b>.")
     if bal <= 0:
         return await cb.message.answer("У вас нет средств на этом балансе.")
-        
+
     await state.set_state(WdFlow.amount)
     await cb.message.answer(f"💸 <b>Вывод {curr.upper()}</b>\n\nДоступно: <b>{bal:g}</b>\nВведите сумму:")
     await cb.answer()
@@ -362,14 +399,14 @@ async def wd_amount(m: Message, state: FSMContext):
     d = await state.get_data()
     curr = d.get('currency')
     if not m.text.replace('.', '', 1).isdigit(): return await m.answer("Введите число:")
-    
+
     amt = float(m.text.strip()) if curr in ['gram', 'stars'] else int(m.text.strip())
     bal = get_balance(m.from_user.id, curr)
     mw = get_min_withdraw()
-    
+
     if curr == 'stars' and amt < mw: return await m.answer(f"Минимум {mw} ⭐.")
     if amt > bal: return await m.answer(f"У вас только {bal:g} {curr.upper()}.")
-    
+
     await state.update_data(amount=amt)
     await state.set_state(WdFlow.username)
     await m.answer(f"Куда отправить <b>{amt:g} {curr.upper()}</b>? Введите ваш @username:")
@@ -381,7 +418,7 @@ async def wd_username(m: Message, state: FSMContext):
     d = await state.get_data(); await state.clear()
     amt = d.get("amount")
     curr = d.get("currency")
-    
+
     if not try_spend(m.from_user.id, curr, amt): return await m.answer("Недостаточно средств.")
     txid = secrets.token_hex(16).upper()
     save_payout(m.from_user.id, amt, curr, u, txid)
@@ -397,6 +434,7 @@ async def shop_support(m: Message):
 async def shop_autoreg(m: Message):
     upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
 
+# ================= ADMIN =================
 adm = Router()
 
 @adm.message(Command("start"))
@@ -416,7 +454,7 @@ async def adm_link(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.update_data(nft_link=m.text.strip())
     await state.set_state(AdminFlow.gift_name)
-    await m.answer("2/5. Введи <b>точное название</b> (например, Fine Pen #28,596):")
+    await m.answer("2/5. Введи <b>точное название</b> (например, DeskCalendar #217157):")
 
 @adm.message(AdminFlow.gift_name)
 async def adm_g(m: Message, state: FSMContext):
@@ -430,7 +468,6 @@ async def adm_p(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     if not m.text.replace('.', '', 1).isdigit(): return await m.answer("Введите число.")
     await state.update_data(price=float(m.text.strip()) if '.' in m.text else int(m.text.strip()))
-    
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Stars", callback_data="a:curr:stars"), InlineKeyboardButton(text="💎 GRAM", callback_data="a:curr:gram")],
         [InlineKeyboardButton(text="🌟 Premium", callback_data="a:curr:premium")]
@@ -443,7 +480,24 @@ async def adm_currency(cb: CallbackQuery, state: FSMContext):
     curr = cb.data.split(":")[2]
     await state.update_data(currency=curr)
     await state.set_state(AdminFlow.target)
-    await cb.message.edit_text("5/5. @username получателя подарка:")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Случайный", callback_data="a:rand_target")]
+    ])
+    await cb.message.edit_text("5/5. @username получателя подарка:", reply_markup=kb)
+    await cb.answer()
+
+@adm.callback_query(F.data == "a:rand_target")
+async def adm_rand_target(cb: CallbackQuery, state: FSMContext):
+    nick = "@" + "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(6, 10)))
+    await state.update_data(target=nick)
+    d = await state.get_data()
+    await state.set_state(AdminFlow.confirm)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить", callback_data="a:confirm_yes"), InlineKeyboardButton(text="❌ Отмена", callback_data="a:confirm_no")],
+        [InlineKeyboardButton(text="🎲 Ещё ник", callback_data="a:rand_target")]
+    ])
+    await cb.message.edit_text(f"Проверка:\nПодарок: <b>{d['gift_name']}</b>\nЦена: <b>{d['price']:g} {d['currency'].upper()}</b>\nПолучатель: <b>{nick}</b>\n\nВсе верно?", reply_markup=kb)
     await cb.answer()
 
 @adm.message(AdminFlow.target)
@@ -454,27 +508,29 @@ async def adm_t(m: Message, state: FSMContext):
     await state.update_data(target=u)
     d = await state.get_data()
     await state.set_state(AdminFlow.confirm)
-    
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Отправить", callback_data="a:confirm_yes"), InlineKeyboardButton(text="❌ Отмена", callback_data="a:confirm_no")]
     ])
-    await m.answer(f"Проверка:\nПодарок: <b>{d['gift_name']}</b>\nЦена: <b>{d['price']:g} {d['currency'].upper()}</b>\nПолучатель: <b>{d['target']}</b>\n\nВсе верно?", reply_markup=kb)
+    await m.answer(f"Проверка:\nПодарок: <b>{d['gift_name']}</b>\nЦена: <b>{d['price']:g} {d['currency'].upper()}</b>\nПолучатель: <b>{u}</b>\n\nВсе верно?", reply_markup=kb)
 
 @adm.callback_query(F.data == "a:confirm_yes")
 async def adm_confirm_yes(cb: CallbackQuery, state: FSMContext, shop_bot: Bot):
     if not is_admin(cb.from_user.id): return
     d = await state.get_data(); await state.clear()
     if not d.get("gift_name"): return await cb.message.answer("Нет данных.")
-    
+
     oid = create_draft(cb.from_user.id, d["gift_name"], d["price"], d["currency"], d["target"], d["nft_link"])
     o = get_offer(oid)
     link_to_bot = f"https://t.me/{SHOP_USERNAME}?start=o_{oid}"
-    
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Передать NFT", url=link_to_bot)],
-        [InlineKeyboardButton(text="✅ Подтвердить передачу", url=link_to_bot)]
+        [
+            InlineKeyboardButton(text="✖️ Отклонить", url=f"https://t.me/{SHOP_USERNAME}"),
+            InlineKeyboardButton(text="✅ Принять", url=link_to_bot)
+        ]
     ])
-    
+
     await shop_bot.send_message(
         chat_id=cb.from_user.id,
         text=offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>",
@@ -536,7 +592,7 @@ async def cb_broadcast_end(m: Message, state: FSMContext):
     await state.clear()
     with db() as c:
         users = c.execute("SELECT user_id FROM users").fetchall()
-    
+
     ok, fail = 0, 0
     msg = await m.answer("⏳ Рассылка началась...")
     for u in users:
@@ -551,16 +607,26 @@ async def cb_broadcast_end(m: Message, state: FSMContext):
 @adm.callback_query(F.data == "a:addbal")
 async def cb_addbal_start(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
-    await state.set_state(AdminFlow.addbal_id)
-    await cb.message.answer("Введите <b>ID пользователя</b>, которому нужно начислить:")
+    await cb.message.answer("Введите <b>ID</b> или <b>@username</b> пользователя для начисления:")
+    await state.set_state(AdminFlow.addbal_search)
     await cb.answer()
 
-@adm.message(AdminFlow.addbal_id)
-async def cb_addbal_id(m: Message, state: FSMContext):
-    if not m.text.isdigit(): return await m.answer("ID должен быть числом.")
-    await state.update_data(uid=int(m.text))
+@adm.message(AdminFlow.addbal_search)
+async def cb_addbal_search(m: Message, state: FSMContext):
+    query = m.text.strip()
+    uid = None
+    if query.startswith('@'):
+        with db() as c:
+            r = c.execute("SELECT user_id FROM users WHERE username=?", (query.lstrip('@'),)).fetchone()
+            if r: uid = r['user_id']
+    elif query.isdigit():
+        uid = int(query)
+
+    if not uid:
+        return await m.answer("Пользователь не найден. Попробуйте снова.")
+        
+    await state.update_data(uid=uid)
     await state.set_state(AdminFlow.addbal_currency)
-    
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Stars", callback_data="a:addcurr:stars"), InlineKeyboardButton(text="💎 GRAM", callback_data="a:addcurr:gram")],
         [InlineKeyboardButton(text="🌟 Premium", callback_data="a:addcurr:premium")]
@@ -580,10 +646,10 @@ async def cb_addbal_amount(m: Message, state: FSMContext):
     if not m.text.replace('.', '', 1).isdigit(): return await m.answer("Введите число.")
     d = await state.get_data(); await state.clear()
     amt = float(m.text) if d['currency'] in ['gram', 'stars'] else int(m.text)
-    
+
     newbal = add_balance(d['uid'], d['currency'], amt)
     await m.answer(f"✅ Пользователю {d['uid']} начислено {amt:g} {d['currency'].upper()}.\nБаланс: {newbal:g}", reply_markup=kb_admin_panel())
-    
+
     try:
         await m.bot.send_message(d['uid'], f"🎁 Вам начислен бонус: <b>{amt:g} {d['currency'].upper()}</b>\nВаш баланс: <b>{newbal:g}</b>")
     except: pass
@@ -593,7 +659,7 @@ async def cb_users(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return await cb.answer("Нет доступа", show_alert=True)
     with db() as c:
         users = c.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 15").fetchall()
-    
+
     text = "👥 <b>Последние 15 юзеров:</b>\n\n"
     for u in users:
         s = get_balance(u["user_id"], 'stars')
@@ -603,6 +669,74 @@ async def cb_users(cb: CallbackQuery):
     await cb.message.answer(text)
     await cb.answer()
 
+@adm.callback_query(F.data == "a:send_offer")
+async def cb_send_offer(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id): return
+    await state.set_state(AdminFlow.send_offer_user)
+    await cb.message.answer("Введи ID юзера, которому отправить оффер:")
+    await cb.answer()
+
+@adm.message(AdminFlow.send_offer_user)
+async def cb_send_offer_user(m: Message, state: FSMContext):
+    if not m.text.isdigit(): return await m.answer("ID должен быть числом.")
+    await state.update_data(target_user=int(m.text))
+    await state.set_state(AdminFlow.send_offer_link)
+    await m.answer("Ссылка на NFT:")
+
+@adm.message(AdminFlow.send_offer_link)
+async def cb_send_offer_link(m: Message, state: FSMContext):
+    await state.update_data(nft_link=m.text.strip())
+    await state.set_state(AdminFlow.send_offer_name)
+    await m.answer("Название подарка:")
+
+@adm.message(AdminFlow.send_offer_name)
+async def cb_send_offer_name(m: Message, state: FSMContext):
+    await state.update_data(gift_name=m.text.strip())
+    await state.set_state(AdminFlow.send_offer_price)
+    await m.answer("Цена:")
+
+@adm.message(AdminFlow.send_offer_price)
+async def cb_send_offer_price(m: Message, state: FSMContext):
+    if not m.text.replace('.', '', 1).isdigit(): return await m.answer("Введите число.")
+    await state.update_data(price=float(m.text) if '.' in m.text else int(m.text))
+    await state.set_state(AdminFlow.send_offer_curr)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Stars", callback_data="a:soc:stars"), InlineKeyboardButton(text="💎 GRAM", callback_data="a:soc:gram")],
+        [InlineKeyboardButton(text="🌟 Premium", callback_data="a:soc:premium")]
+    ])
+    await m.answer("Валюта:", reply_markup=kb)
+
+@adm.callback_query(F.data.startswith("a:soc:"))
+async def cb_send_offer_curr(cb: CallbackQuery, state: FSMContext):
+    curr = cb.data.split(":")[2]
+    await state.update_data(currency=curr)
+    await state.set_state(AdminFlow.send_offer_target)
+    await cb.message.edit_text("Получатель подарка (@username):")
+    await cb.answer()
+
+@adm.message(AdminFlow.send_offer_target)
+async def cb_send_offer_target(m: Message, state: FSMContext, shop_bot: Bot):
+    u = norm_u(m.text)
+    if not u: return await m.answer("Формат @username.")
+    d = await state.get_data(); await state.clear()
+    oid = create_draft(m.from_user.id, d["gift_name"], d["price"], d["currency"], u, d["nft_link"])
+    o = get_offer(oid)
+    link_to_bot = f"https://t.me/{SHOP_USERNAME}?start=o_{oid}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✖️ Отклонить", url=f"https://t.me/{SHOP_USERNAME}"),
+            InlineKeyboardButton(text="✅ Принять", url=link_to_bot)
+        ]
+    ])
+    await shop_bot.send_message(
+        chat_id=d["target_user"],
+        text=offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>",
+        reply_markup=kb,
+        disable_web_page_preview=False
+    )
+    await m.answer(f"✅ Оффер #{oid} отправлен юзеру {d['target_user']}.", reply_markup=kb_admin_panel())
+
+# ================= WEB =================
 async def handle_ping(request):
     return web.Response(text="OK")
 
@@ -619,13 +753,12 @@ async def self_ping(url):
 async def main():
     init_db()
     shop_bot = Bot(SHOP_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    adm_bot = Bot(ADMIN_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    adm_bot = Bot(ADMIN_TOKEN if ADMIN_TOKEN else SHOP_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
     await shop_bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
         BotCommand(command="support", description="Поддержка"),
     ])
-    
     await adm_bot.set_my_commands([
         BotCommand(command="start", description="Админ-панель"),
     ])
@@ -646,7 +779,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080)))
     await site.start()
-    
+
     render_url = os.getenv("RENDER_EXTERNAL_URL")
     if render_url:
         asyncio.create_task(self_ping(render_url))
