@@ -264,7 +264,7 @@ def offer_text(o) -> str:
     return (
         f"Пользователь предлагает Вам {reward} за {o['gift_name']}\n\n"
         f"Предложение действует ещё {time_left}\n\n"
-        f"🔗 <a href='{o['nft_link'] or 'https://t.me'}'><b>Посмотреть NFT</b></a>"
+        f"Посмотреть NFT: {o['nft_link']}"
     )
 
 def offer_kb(oid: int) -> InlineKeyboardMarkup:
@@ -358,8 +358,6 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
         if not o: return await m.answer("Оффер не найден.")
         if o["status"] != "draft" and o["user_id"] != m.from_user.id:
             return await m.answer("Этот оффер уже использован.")
-        
-        # Если оффер новый (draft), занимаем его
         if o["status"] == "draft":
             if not claim_offer(oid, m.from_user.id):
                 return await m.answer("Оффер уже занят.")
@@ -369,31 +367,12 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
                     f"🔔 Оффер #{oid} открыт: <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a>")
             except Exception: pass
         
-        # ФОРМИРУЕМ ТЕКСТ С СЫЛКОЙ (чтобы Telegram сделал WebApp)
-        reward = reward_label(o["reward_type"] or "stars", o["reward_value"] or 0)
-        expires_at = datetime.fromisoformat(o["expires_at"]); now_dt = datetime.now(timezone.utc)
-        delta = expires_at - now_dt
-        hours, rem = divmod(delta.seconds, 3600) if delta.seconds > 0 else (0,0)
-        time_left = f"{hours} ч. {rem // 60} м."
-        
-        text = (
-            f"Пользователь предлагает Вам {reward} за {o['gift_name']}\n\n"
-            f"Предложение действует ещё {time_left}\n\n"
-            f"🔗 <a href='{o['nft_link']}'>Посмотреть NFT</a>"
-        )
-        
+        text = offer_text(o)
         kb = offer_kb(oid)
         
-        # 1. Отправляем ОДНО сообщение с WebApp-ссылкой
-        msg = await m.answer(text, disable_web_page_preview=False, parse_mode="HTML")
-        
-        # 2. Прикрепляем кнопки к этому же сообщению (с задержкой, чтобы Telegram отрисовал)
-        await asyncio.sleep(0.8)
-        try:
-            await msg.edit_reply_markup(reply_markup=kb)
-        except Exception as e:
-            log.error(f"Telegram отказался прикреплять кнопки к WebApp: {e}")
-            
+        # ОТПРАВЛЯЕМ СРАЗУ С КНОПКАМИ И ВКЛЮЧЕННЫМ ПРЕВЬЮ
+        # Без parse_mode="HTML", чтобы Telegram не сбрасывал клавиатуру
+        await m.answer(text, reply_markup=kb, disable_web_page_preview=False)
         return
 
     with db() as c:
