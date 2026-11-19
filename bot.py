@@ -369,8 +369,8 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
         text = offer_text(o)
         kb = offer_kb(oid)
         
-        # Отправляем ТОЛЬКО текст с кнопками, БЕЗ картинки и БЕЗ разворота ссылки
-        await m.answer(text, reply_markup=kb, disable_web_page_preview=True)
+        # Отправляем текст, ОТКЛЮЧАЕМ скрытие превью (чтобы ссылка развернулась как на фото 2)
+        await m.answer(text, reply_markup=kb, disable_web_page_preview=False)
         return
 
     with db() as c:
