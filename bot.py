@@ -326,6 +326,7 @@ class AdminFlow(StatesGroup):
     reward_val  = State()
     target      = State()
     confirm     = State()
+    action      = State() # Для кнопочных действий
 
 class PromoCreate(StatesGroup):
     reward_type  = State()
@@ -650,31 +651,36 @@ async def shop_autoreg(m: Message):
 # ================= ADMIN BOT =================
 adm = Router()
 
+def adm_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Создать оффер", callback_data="adm:offer")],
+        [InlineKeyboardButton(text="💰 Начислить", callback_data="adm:addbal"), 
+         InlineKeyboardButton(text="👑 Выдать Premium", callback_data="adm:grantprem")],
+        [InlineKeyboardButton(text="🎟 Промокоды", callback_data="adm:promos"), 
+         InlineKeyboardButton(text="👥 Юзеры", callback_data="adm:users")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"), 
+         InlineKeyboardButton(text="🧹 Очистить мусор", callback_data="adm:cleanup")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:broadcast")],
+    ])
+
 @adm.message(Command("start"))
 async def adm_start(m: Message):
     if not is_admin(m.from_user.id): return
-    await m.answer(
-        "🛠 <b>Админ-панель</b>\n\n"
-        "/offer — создать оффер\n"
-        "/addbal &lt;id&gt; &lt;stars|gram&gt; &lt;сумма&gt; — начислить\n"
-        "/grantprem &lt;id&gt; &lt;мес&gt; — выдать Premium вручную\n"
-        "/promo_new — создать промокод\n"
-        "/promo_list — список промокодов\n"
-        "/promo_del &lt;code&gt; — удалить промокод\n"
-        "/users — последние юзеры\n"
-        "/find &lt;@username|id&gt; — поиск\n"
-        "/user &lt;id&gt; — карточка\n"
-        "/setmin &lt;сумма&gt; — лимит вывода Stars\n"
-        "/cleanup — чистка отработанных\n"
-        "/broadcast &lt;текст&gt; — рассылка\n"
-        "/stats — статистика"
-    )
+    await m.answer("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=adm_main_kb())
 
-@adm.message(Command("offer"))
-async def adm_offer(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id): return
+@adm.callback_query(F.data == "adm:main")
+async def adm_back_to_main(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=adm_main_kb())
+    await cb.answer()
+
+# ================= ОФФЕР =================
+@adm.callback_query(F.data == "adm:offer")
+async def adm_btn_offer(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AdminFlow.nft_link)
-    await m.answer("1/5. Скинь <b>ссылку на NFT</b>:")
+    await cb.message.edit_text("1/5. Скинь <b>ссылку на NFT</b>:", 
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")]]))
+    await cb.answer()
 
 @adm.message(AdminFlow.nft_link)
 async def adm_link(m: Message, state: FSMContext):
@@ -694,6 +700,7 @@ async def adm_g(m: Message, state: FSMContext):
         [InlineKeyboardButton(text="⭐ Stars", callback_data="rt:stars")],
         [InlineKeyboardButton(text="💎 Граммы", callback_data="rt:gram")],
         [InlineKeyboardButton(text="👑 Telegram Premium", callback_data="rt:premium")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")]
     ]))
 
 @adm.callback_query(F.data.startswith("rt:"))
@@ -703,11 +710,11 @@ async def adm_reward_type(cb: CallbackQuery, state: FSMContext):
     await state.update_data(reward_type=rtype)
     await state.set_state(AdminFlow.reward_val)
     if rtype == "stars":
-        await cb.message.answer("Сколько <b>звёзд</b>? (число)")
+        await cb.message.edit_text("Сколько <b>звёзд</b>? (число)")
     elif rtype == "gram":
-        await cb.message.answer("Сколько <b>грамм</b>? (например 500)")
+        await cb.message.edit_text("Сколько <b>грамм</b>? (например 500)")
     else:
-        await cb.message.answer("Срок Premium в месяцах: <b>3</b>, <b>6</b> или <b>12</b>:")
+        await cb.message.edit_text("Срок Premium в месяцах: <b>3</b>, <b>6</b> или <b>12</b>:")
     await cb.answer()
 
 @adm.message(AdminFlow.reward_val)
@@ -730,6 +737,10 @@ async def adm_reward_val(m: Message, state: FSMContext):
 @adm.message(AdminFlow.target)
 async def adm_t(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
+    # Защита от перехвата кнопочных стейтов
+    data = await state.get_data()
+    if data.get("action"): return await adm_input_handler(m, state)
+
     u = norm_u(m.text)
     if not u: return await m.answer("Формат @username.")
     await state.update_data(target=u)
@@ -739,94 +750,168 @@ async def adm_t(m: Message, state: FSMContext):
         f"Проверка:\n"
         f"Подарок: <b>{d['gift_name']}</b>\n"
         f"Награда: <b>{reward_label(d['reward_type'], d['reward_value'])}</b>\n"
-        f"Получатель: <b>{d['target']}</b>\n\nОтправить? /yes или /no"
+        f"Получатель: <b>{d['target']}</b>\n\nСоздаем?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Создать", callback_data="adm:offer_yes")],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")]
+        ])
     )
 
-@adm.message(Command("yes"))
-async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
-    if not is_admin(m.from_user.id): return
+@adm.callback_query(F.data == "adm:offer_yes")
+async def adm_yes(cb: CallbackQuery, state: FSMContext, shop_bot: Bot):
+    if not is_admin(cb.from_user.id): return await cb.answer("Нет доступа", show_alert=True)
     d = await state.get_data(); await state.clear()
-    if not d.get("gift_name"): return await m.answer("Нет данных.")
+    if not d.get("gift_name"): return await cb.message.edit_text("Нет данных.")
 
-    oid = create_draft(m.from_user.id, d["gift_name"], d["reward_type"], d["reward_value"], d["target"], d["nft_link"])
+    oid = create_draft(cb.from_user.id, d["gift_name"], d["reward_type"], d["reward_value"], d["target"], d["nft_link"])
     o = get_offer(oid)
     link_to_bot = f"https://t.me/{SHOP_USERNAME}?start=o_{oid}"
 
     text = offer_text(o)
     preview = await fetch_nft_preview(o["nft_link"]) if o["nft_link"] else None
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="👁 Посмотреть NFT", url=link_to_bot)
-    ]])
+    
     try:
         if preview:
-            await shop_bot.send_photo(m.from_user.id, BufferedInputFile(preview, filename=f"nft_{oid}.jpg"),
-                                      caption=text, reply_markup=kb)
+            await shop_bot.send_photo(cb.from_user.id, BufferedInputFile(preview, filename=f"nft_{oid}.jpg"), caption=text)
         else:
-            await shop_bot.send_message(m.from_user.id, text, reply_markup=kb, disable_web_page_preview=False)
-    except Exception as e:
-        await m.answer(f"Не смог отправить карточку: {e}")
-
-    await m.answer(f"📨 <b>Оффер #{oid} готов.</b>\n\nСсылка для жертвы:\n<code>{link_to_bot}</code>")
-
-@adm.message(Command("no"))
-async def adm_no(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id): return
-    await state.clear(); await m.answer("Отменено.")
-
-@adm.message(Command("addbal"))
-async def adm_addbal(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()
-    if len(args) != 4 or args[2] not in ("stars", "gram"):
-        return await m.answer("Использование: <code>/addbal ID stars|gram СУММА</code>")
-    try:
-        uid = int(args[1])
-        if args[2] == "gram":
-            val = int(round(float(args[3].replace(",", ".")) * 1000))
-            add_balance(uid, "gram", val)
-        else:
-            val = int(args[3])
-            add_balance(uid, "stars", val)
-    except ValueError:
-        return await m.answer("Неверные числа.")
-    stars, gram = get_balance(uid)
-    await m.answer(f"✅ {uid}: {stars} ⭐ | {gram/1000:g} гр.")
-    try:
-        await m.bot.send_message(uid, f"🎁 Вам начислен бонус.\nБаланс: {stars} ⭐ | {gram/1000:g} гр.")
+            await shop_bot.send_message(cb.from_user.id, text, disable_web_page_preview=False)
     except Exception: pass
+    
+    await cb.message.edit_text(f"📨 <b>Оффер #{oid} готов.</b>\n\nСсылка для жертвы:\n<code>{link_to_bot}</code>", reply_markup=adm_main_kb())
+    await cb.answer("Создан")
 
-@adm.message(Command("grantprem"))
-async def adm_grantprem(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()
-    if len(args) != 3:
-        return await m.answer("Использование: <code>/grantprem ID МЕСЯЦЫ</code>")
-    try:
-        uid = int(args[1]); months = int(args[2])
-    except ValueError:
-        return await m.answer("Числа, плиз.")
-    rid = create_premium_granted(uid, f"@{uid}", months)
-    await m.answer(f"👑 Premium {months} мес. выдан (id {rid}).")
-    try:
-        await m.bot.send_message(uid, f"👑 Вам выдан Telegram Premium на {months} мес.")
-    except Exception: pass
+# ================= КНОПКИ ВВОДА =================
+@adm.callback_query(F.data == "adm:addbal")
+async def adm_btn_addbal(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFlow.target)
+    await state.update_data(action="addbal")
+    await cb.message.edit_text("Введите данные для начисления:\nФормат: <code>ID stars|gram СУММА</code>\nПример: <code>123456789 stars 500</code>", 
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")]]))
+    await cb.answer()
 
-@adm.message(Command("promo_new"))
-async def adm_promo_new(m: Message, state: FSMContext):
+@adm.callback_query(F.data == "adm:grantprem")
+async def adm_btn_grantprem(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFlow.target)
+    await state.update_data(action="grantprem")
+    await cb.message.edit_text("Введите данные для выдачи Premium:\nФормат: <code>ID МЕСЯЦЫ</code>\nПример: <code>123456789 3</code>", 
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")]]))
+    await cb.answer()
+
+@adm.callback_query(F.data == "adm:broadcast")
+async def adm_btn_broadcast(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFlow.target)
+    await state.update_data(action="broadcast")
+    await cb.message.edit_text("Введите текст для рассылки:", 
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")]]))
+    await cb.answer()
+
+@adm.message(AdminFlow.target)
+async def adm_input_handler(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
+    data = await state.get_data()
+    action = data.get("action")
+    
+    if action == "addbal":
+        args = m.text.split()
+        if len(args) != 3 or args[1] not in ("stars", "gram"):
+            return await m.answer("Ошибка. Формат: ID stars|gram СУММА")
+        try:
+            uid = int(args[0])
+            if args[1] == "gram":
+                val = int(round(float(args[2].replace(",", ".")) * 1000))
+                add_balance(uid, "gram", val)
+            else:
+                val = int(args[2])
+                add_balance(uid, "stars", val)
+        except ValueError:
+            return await m.answer("Неверные числа.")
+        stars, gram = get_balance(uid)
+        await m.answer(f"✅ {uid}: {stars} ⭐ | {gram/1000:g} гр.", reply_markup=adm_main_kb())
+        try: await m.bot.send_message(uid, f"🎁 Бонус!\nБаланс: {stars} ⭐ | {gram/1000:g} гр.")
+        except Exception: pass
+        await state.clear()
+
+    elif action == "grantprem":
+        args = m.text.split()
+        if len(args) != 2: return await m.answer("Ошибка. Формат: ID МЕСЯЦЫ")
+        try:
+            uid = int(args[0]); months = int(args[1])
+        except ValueError:
+            return await m.answer("Числа, плиз.")
+        rid = create_premium_granted(uid, f"@{uid}", months)
+        await m.answer(f"👑 Premium {months} мес. выдан (id {rid}).", reply_markup=adm_main_kb())
+        try: await m.bot.send_message(uid, f"👑 Выдан Telegram Premium на {months} мес.")
+        except Exception: pass
+        await state.clear()
+    
+    elif action == "broadcast":
+        text = m.text
+        with db() as c:
+            users = c.execute("SELECT user_id FROM users").fetchall()
+        ok = fail = 0
+        for u in users:
+            try:
+                await m.bot.send_message(u["user_id"], text)
+                ok += 1; await asyncio.sleep(0.05)
+            except Exception: fail += 1
+        await m.answer(f"📢 Готово. Успешно: {ok}, ошибок: {fail}", reply_markup=adm_main_kb())
+        await state.clear()
+    else:
+        # Если это стейт из создания оффера, отдаем туда
+        await adm_t(m, state)
+
+# ================= ПРОМО =================
+@adm.callback_query(F.data == "adm:promos")
+async def adm_btn_promos(cb: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Создать", callback_data="adm:promo_new")],
+        [InlineKeyboardButton(text="📋 Список", callback_data="adm:promo_list")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")]
+    ])
+    await cb.message.edit_text("🎟 <b>Управление промокодами</b>", reply_markup=kb)
+    await cb.answer()
+
+@adm.callback_query(F.data == "adm:promo_list")
+async def adm_btn_promo_list(cb: CallbackQuery):
+    with db() as c:
+        rows = c.execute("SELECT * FROM promos ORDER BY created_at DESC LIMIT 30").fetchall()
+    
+    kb = [[InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:promos")]]
+    if not rows:
+        return await cb.message.edit_text("Промокодов нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    
+    text = "🎟 <b>Промокоды:</b>\n"
+    for r in rows:
+        text += f"<code>{r['code']}</code> — {reward_label(r['reward_type'], r['reward_value'])} · осталось {r['uses_left']}\n"
+        kb.insert(0, [InlineKeyboardButton(text=f"❌ Удалить {r['code']}", callback_data=f"adm:pdel:{r['code']}")])
+    
+    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await cb.answer()
+
+@adm.callback_query(F.data.startswith("adm:pdel:"))
+async def adm_btn_promo_del(cb: CallbackQuery):
+    code = cb.data.split(":")[2]
+    with db() as c:
+        c.execute("DELETE FROM promos WHERE code=?", (code,))
+    await cb.answer("Удален", show_alert=True)
+    await adm_btn_promo_list(cb)
+
+@adm.callback_query(F.data == "adm:promo_new")
+async def adm_btn_promo_new(cb: CallbackQuery, state: FSMContext):
     await state.set_state(PromoCreate.reward_type)
-    await m.answer("Тип награды:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await cb.message.edit_text("Тип награды:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Stars", callback_data="prt:stars")],
         [InlineKeyboardButton(text="💎 Граммы", callback_data="prt:gram")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:promos")]
     ]))
+    await cb.answer()
 
 @adm.callback_query(F.data.startswith("prt:"))
 async def adm_promo_type(cb: CallbackQuery, state: FSMContext):
-    if not is_admin(cb.from_user.id): return await cb.answer("Нет доступа", show_alert=True)
     rtype = cb.data.split(":")[1]
     await state.update_data(reward_type=rtype)
     await state.set_state(PromoCreate.reward_value)
-    await cb.message.answer("Сумма (для грамм можно 500):")
+    await cb.message.edit_text("Сумма (для грамм можно 500):")
     await cb.answer()
 
 @adm.message(PromoCreate.reward_value)
@@ -855,122 +940,37 @@ async def adm_promo_uses(m: Message, state: FSMContext):
         return await m.answer("Число > 0.")
     d = await state.get_data(); await state.clear()
     code = create_promo(d["reward_type"], d["reward_value"], uses, m.from_user.id)
-    await m.answer(f"🎟 Промокод: <code>{code}</code>\n"
-                   f"Награда: {reward_label(d['reward_type'], d['reward_value'])}\n"
-                   f"Активаций: {uses}")
+    await m.answer(f"🎟 Промокод: <code>{code}</code>\nНаграда: {reward_label(d['reward_type'], d['reward_value'])}\nАктиваций: {uses}", reply_markup=adm_main_kb())
 
-@adm.message(Command("promo_list"))
-async def adm_promo_list(m: Message):
-    if not is_admin(m.from_user.id): return
+# ================= ЮЗЕРЫ / СТАТИСТИКА / ОЧИСТКА =================
+@adm.callback_query(F.data == "adm:users")
+async def adm_btn_users(cb: CallbackQuery):
     with db() as c:
-        rows = c.execute("SELECT * FROM promos ORDER BY created_at DESC LIMIT 30").fetchall()
-    if not rows: return await m.answer("Промокодов нет.")
-    text = "🎟 <b>Промокоды:</b>\n"
-    for r in rows:
-        text += f"<code>{r['code']}</code> — {reward_label(r['reward_type'], r['reward_value'])} · осталось {r['uses_left']}\n"
-    await m.answer(text)
-
-@adm.message(Command("promo_del"))
-async def adm_promo_del(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()
-    if len(args) != 2: return await m.answer("Использование: <code>/promo_del CODE</code>")
-    with db() as c:
-        res = c.execute("DELETE FROM promos WHERE code=?", (args[1].upper(),))
-    await m.answer(f"Удалено: {res.rowcount}")
-
-@adm.message(Command("cleanup"))
-async def adm_cleanup(m: Message):
-    if not is_admin(m.from_user.id): return
-    with db() as c:
-        res = c.execute("DELETE FROM offers WHERE status IN ('paid','declined','cancelled','delivered')")
-    await m.answer(f"✅ Удалено: {res.rowcount}")
-
-@adm.message(Command("users"))
-async def adm_users(m: Message):
-    if not is_admin(m.from_user.id): return
-    with db() as c:
-        users = c.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 30").fetchall()
-    if not users: return await m.answer("Пусто.")
-    text = "👥 <b>Последние 30:</b>\n"
+        users = c.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 20").fetchall()
+    text = "👥 <b>Последние 20 юзеров:</b>\n\n"
     for u in users:
         stars, gram = get_balance(u["user_id"])
         text += f"<code>{u['user_id']}</code> @{u['username'] or '—'} — {stars} ⭐ {gram/1000:g} гр.\n"
-    await m.answer(text)
+    await cb.message.edit_text(text or "Пусто.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")]]))
+    await cb.answer()
 
-@adm.message(Command("find"))
-async def adm_find(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()
-    if len(args) != 2: return await m.answer("Использование: <code>/find @username|id</code>")
-    q = args[1].strip()
-    with db() as c:
-        if q.isdigit():
-            u = c.execute("SELECT * FROM users WHERE user_id=?", (int(q),)).fetchone()
-        else:
-            u = c.execute("SELECT * FROM users WHERE LOWER(username)=?", (q.lstrip("@").lower(),)).fetchone()
-    if not u: return await m.answer("Не найден.")
-    stars, gram = get_balance(u["user_id"])
-    await m.answer(f"👤 <code>{u['user_id']}</code> @{u['username'] or '—'} — {stars} ⭐ {gram/1000:g} гр.")
-
-@adm.message(Command("user"))
-async def adm_user(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()
-    if len(args) != 2 or not args[1].isdigit():
-        return await m.answer("Использование: <code>/user ID</code>")
-    uid = int(args[1])
-    with db() as c:
-        u = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-        if not u: return await m.answer("Нет такого.")
-        offers_count = c.execute("SELECT COUNT(*) FROM offers WHERE user_id=? AND status='paid'", (uid,)).fetchone()[0]
-        payouts_sum = c.execute("SELECT COALESCE(SUM(amount),0) FROM payouts WHERE user_id=?", (uid,)).fetchone()[0]
-    stars, gram = get_balance(uid)
-    await m.answer(
-        f"👤 <b>Юзер {uid}</b>\n"
-        f"Ник: @{u['username'] or '—'}\n"
-        f"Баланс: <b>{stars} ⭐ | {gram/1000:g} гр.</b>\n"
-        f"Сдал подарков: {offers_count}\n"
-        f"Вывел: {payouts_sum}"
-    )
-
-@adm.message(Command("setmin"))
-async def adm_setmin(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()
-    if len(args) != 2 or not args[1].isdigit():
-        return await m.answer("Использование: <code>/setmin СУММА</code>")
-    set_setting("min_withdraw", int(args[1]))
-    await m.answer(f"✅ Минимум вывода Stars = {args[1]}")
-
-@adm.message(Command("broadcast"))
-async def adm_broadcast(m: Message):
-    if not is_admin(m.from_user.id): return
-    parts = m.text.split(maxsplit=1)
-    if len(parts) != 2: return await m.answer("Использование: <code>/broadcast ТЕКСТ</code>")
-    text = parts[1]
-    with db() as c:
-        users = c.execute("SELECT user_id FROM users").fetchall()
-    ok = fail = 0
-    for u in users:
-        try:
-            await m.bot.send_message(u["user_id"], text)
-            ok += 1; await asyncio.sleep(0.05)
-        except Exception: fail += 1
-    await m.answer(f"📢 Готово. Успешно: {ok}, ошибок: {fail}")
-
-@adm.message(Command("stats"))
-async def adm_stats(m: Message):
-    if not is_admin(m.from_user.id): return
+@adm.callback_query(F.data == "adm:stats")
+async def adm_btn_stats(cb: CallbackQuery):
     with db() as c:
         u = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         o = c.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
         p = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payouts").fetchone()
         prem = c.execute("SELECT COUNT(*) FROM premium_requests WHERE status='granted'").fetchone()[0]
-    await m.answer(
-        f"📊 <b>Статистика</b>\n"
-        f"Юзеров: {u}\nОфферов: {o}\nВыплат: {p[0]} ({p[1]})\nPremium выдан: {prem}"
-    )
+    text = f"📊 <b>Статистика</b>\n\nЮзеров: {u}\nОфферов: {o}\nВыплат: {p[0]} ({p[1]})\nPremium выдан: {prem}"
+    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")]]))
+    await cb.answer()
+
+@adm.callback_query(F.data == "adm:cleanup")
+async def adm_btn_cleanup(cb: CallbackQuery):
+    with db() as c:
+        res = c.execute("DELETE FROM offers WHERE status IN ('paid','declined','cancelled','delivered')")
+    await cb.answer(f"✅ Удалено: {res.rowcount}", show_alert=True)
+    await cb.message.edit_text("🧹 <b>База очищена.</b>", reply_markup=adm_main_kb())
 
 # ================= WEB SERVER =================
 async def handle_ping(request):
@@ -996,12 +996,7 @@ async def main():
         BotCommand(command="support", description="Поддержка"),
     ])
     await adm_bot.set_my_commands([
-        BotCommand(command="start",      description="Админ-панель"),
-        BotCommand(command="offer",      description="Создать оффер"),
-        BotCommand(command="addbal",     description="Начислить баланс"),
-        BotCommand(command="grantprem",  description="Выдать Premium"),
-        BotCommand(command="promo_new",  description="Создать промокод"),
-        BotCommand(command="stats",      description="Статистика"),
+        BotCommand(command="start", description="Админ-панель"),
     ])
 
     shop_dp = Dispatcher(storage=MemoryStorage()); shop_dp.include_router(shop)
