@@ -1,5 +1,6 @@
-import asyncio, logging, os, re, secrets, sqlite3
+import asyncio, logging, os, re, secrets, sqlite3, html, random, string
 from datetime import datetime, timedelta
+from typing import Optional
 from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -9,21 +10,23 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, BotCommand
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    BotCommand, BufferedInputFile,
 )
 
-SHOP_TOKEN = os.getenv("SHOP_TOKEN", "PASTE_SHOP_TOKEN")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "PASTE_ADMIN_TOKEN")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "123").split(",") if x.strip().isdigit()}
-SHOP_USERNAME = os.getenv("SHOP_USERNAME", "your_shop_bot")
-SUPPORT = os.getenv("SUPPORT", "@your_support")
-DB_PATH = os.getenv("DB_PATH", "offers.db")
+# ================= ENV =================
+SHOP_TOKEN     = os.getenv("SHOP_TOKEN", "PASTE_SHOP_TOKEN")
+ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "PASTE_ADMIN_TOKEN")
+ADMIN_IDS      = {int(x) for x in os.getenv("ADMIN_IDS", "123").split(",") if x.strip().isdigit()}
+SHOP_USERNAME  = os.getenv("SHOP_USERNAME", "your_shop_bot")
+SUPPORT        = os.getenv("SUPPORT", "").strip()
+DB_PATH        = os.getenv("DB_PATH", "offers.db")
 
 DEFAULT_MIN_WITHDRAW = int(os.getenv("MIN_WITHDRAW", "500"))
-PAYOUT_DELAY_SEC = 7
-OFFER_TTL_HOURS = 6
-REF_BONUS = 500
-REF_HOLD_DAYS = 7
+PAYOUT_DELAY_SEC     = 7
+OFFER_TTL_HOURS      = 6
+REF_BONUS            = 500
+REF_HOLD_DAYS        = 7
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dual")
@@ -32,6 +35,7 @@ log = logging.getLogger("dual")
 def db():
     c = sqlite3.connect(DB_PATH); c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL"); return c
+
 def now(): return datetime.utcnow().isoformat()
 
 def init_db():
@@ -39,76 +43,128 @@ def init_db():
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT, referrer_id INTEGER,
-            vip_level TEXT DEFAULT 'Bronze', vip_limit INTEGER DEFAULT 500, delivered_count INTEGER DEFAULT 0, created_at TEXT
+            vip_level TEXT DEFAULT 'Bronze', vip_limit INTEGER DEFAULT 500,
+            delivered_count INTEGER DEFAULT 0, created_at TEXT
         );
         CREATE TABLE IF NOT EXISTS offers (
             id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, user_id INTEGER,
-            gift_name TEXT, price_stars INTEGER, target_username TEXT,
+            gift_name TEXT, reward_type TEXT DEFAULT 'stars',
+            reward_value INTEGER, price_stars INTEGER DEFAULT 0,
+            target_username TEXT,
             status TEXT DEFAULT 'draft', created_at TEXT, expires_at TEXT,
             accepted_at TEXT, delivered_at TEXT, paid_at TEXT, proof TEXT, nft_link TEXT
         );
-        CREATE TABLE IF NOT EXISTS balances (user_id INTEGER PRIMARY KEY, stars INTEGER DEFAULT 0, updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS payouts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, username TEXT, txid TEXT, created_at TEXT);
-        CREATE TABLE IF NOT EXISTS referrals (id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, user_id INTEGER, created_at TEXT, UNIQUE(user_id));
+        CREATE TABLE IF NOT EXISTS balances (
+            user_id INTEGER PRIMARY KEY, stars INTEGER DEFAULT 0,
+            ton_mg INTEGER DEFAULT 0, updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS payouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER,
+            currency TEXT DEFAULT 'stars', username TEXT, txid TEXT, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, user_id INTEGER,
+            created_at TEXT, UNIQUE(user_id)
+        );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS pending_referrals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, ref_id INTEGER, release_at TEXT, status TEXT DEFAULT 'pending'
+            id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, ref_id INTEGER,
+            release_at TEXT, status TEXT DEFAULT 'pending'
+        );
+        CREATE TABLE IF NOT EXISTS promos (
+            code TEXT PRIMARY KEY, reward_type TEXT, reward_value INTEGER,
+            uses_left INTEGER, created_by INTEGER, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS promo_uses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT, user_id INTEGER, used_at TEXT,
+            UNIQUE(code, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS premium_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT,
+            months INTEGER, status TEXT DEFAULT 'pending',
+            created_at TEXT, resolved_at TEXT
         );
         """)
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdraw', ?)", (str(DEFAULT_MIN_WITHDRAW),))
 
-def get_min_withdraw():
+def get_setting(key, default=None):
     with db() as c:
-        r = c.execute("SELECT value FROM settings WHERE key='min_withdraw'").fetchone()
-        return int(r["value"]) if r else DEFAULT_MIN_WITHDRAW
+        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else default
 
-def set_min_withdraw(val):
+def set_setting(key, val):
     with db() as c:
-        c.execute("UPDATE settings SET value=? WHERE key='min_withdraw'", (str(val),))
+        c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  (key, str(val)))
+
+def get_min_withdraw(): return int(get_setting("min_withdraw", DEFAULT_MIN_WITHDRAW))
 
 def upsert_user(uid, username, full_name, referrer_id=None):
     with db() as c:
         if not c.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
-            c.execute("INSERT INTO users(user_id,username,full_name,referrer_id,created_at) VALUES (?,?,?,?,?)", (uid, username, full_name, referrer_id, now()))
+            c.execute("INSERT INTO users(user_id,username,full_name,referrer_id,created_at) VALUES (?,?,?,?,?)",
+                      (uid, username, full_name, referrer_id, now()))
             if referrer_id and referrer_id != uid:
                 release_date = (datetime.utcnow() + timedelta(days=REF_HOLD_DAYS)).isoformat()
-                c.execute("INSERT INTO pending_referrals(referrer_id, ref_id, release_at) VALUES (?,?,?)", (referrer_id, uid, release_date))
+                c.execute("INSERT INTO pending_referrals(referrer_id, ref_id, release_at) VALUES (?,?,?)",
+                          (referrer_id, uid, release_date))
         else:
-            c.execute("UPDATE users SET username=COALESCE(?,username), full_name=COALESCE(?,full_name) WHERE user_id=?", (username, full_name, uid))
+            c.execute("UPDATE users SET username=COALESCE(?,username), full_name=COALESCE(?,full_name) WHERE user_id=?",
+                      (username, full_name, uid))
 
 def check_pending_referrals(uid):
     with db() as c:
         now_dt = datetime.utcnow().isoformat()
-        ready = c.execute("SELECT * FROM pending_referrals WHERE referrer_id=? AND status='pending' AND release_at <= ?", (uid, now_dt)).fetchall()
+        ready = c.execute("SELECT * FROM pending_referrals WHERE referrer_id=? AND status='pending' AND release_at <= ?",
+                          (uid, now_dt)).fetchall()
         for r in ready:
-            add_balance(uid, REF_BONUS)
+            add_balance_inline(c, uid, "stars", REF_BONUS)
             c.execute("UPDATE pending_referrals SET status='paid' WHERE id=?", (r["id"],))
         return len(ready)
 
-def add_balance_inline(conn, uid, delta):
-    conn.execute("INSERT INTO balances(user_id,stars,updated_at) VALUES (?,?,?) ON CONFLICT(user_id) DO UPDATE SET stars=stars+excluded.stars, updated_at=excluded.updated_at", (uid, delta, now()))
+def add_balance_inline(conn, uid, currency, delta):
+    conn.execute("INSERT OR IGNORE INTO balances(user_id,stars,ton_mg,updated_at) VALUES (?,0,0,?)", (uid, now()))
+    if currency == "stars":
+        conn.execute("UPDATE balances SET stars=stars+?, updated_at=? WHERE user_id=?", (delta, now(), uid))
+    elif currency == "gram":
+        conn.execute("UPDATE balances SET ton_mg=ton_mg+?, updated_at=? WHERE user_id=?", (delta, now(), uid))
 
 def get_balance(uid):
     with db() as c:
-        r = c.execute("SELECT stars FROM balances WHERE user_id=?", (uid,)).fetchone()
-        return r["stars"] if r else 0
-def add_balance(uid, delta):
+        r = c.execute("SELECT stars, ton_mg FROM balances WHERE user_id=?", (uid,)).fetchone()
+        return (r["stars"] or 0, r["ton_mg"] or 0) if r else (0, 0)
+
+def add_balance(uid, currency, delta):
     with db() as c:
-        add_balance_inline(c, uid, delta)
-        return c.execute("SELECT stars FROM balances WHERE user_id=?", (uid,)).fetchone()["stars"]
-def try_spend(uid, amount):
+        add_balance_inline(c, uid, currency, delta)
+    return get_balance(uid)
+
+def try_spend_stars(uid, amount):
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         r = c.execute("SELECT stars FROM balances WHERE user_id=?", (uid,)).fetchone()
-        if not r or r["stars"] < amount: c.rollback(); return False
+        if not r or r["stars"] < amount:
+            c.rollback(); return False
         c.execute("UPDATE balances SET stars=stars-?, updated_at=? WHERE user_id=?", (amount, now(), uid))
         c.commit(); return True
 
-def create_draft(admin_id, gift_name, price, target, nft_link):
+def try_spend_gram(uid, mg):
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        r = c.execute("SELECT ton_mg FROM balances WHERE user_id=?", (uid,)).fetchone()
+        if not r or r["ton_mg"] < mg:
+            c.rollback(); return False
+        c.execute("UPDATE balances SET ton_mg=ton_mg-?, updated_at=? WHERE user_id=?", (mg, now(), uid))
+        c.commit(); return True
+
+def create_draft(admin_id, gift_name, reward_type, reward_value, target, nft_link):
     expires = (datetime.utcnow() + timedelta(hours=OFFER_TTL_HOURS)).isoformat()
     with db() as c:
-        return c.execute("INSERT INTO offers(admin_id,user_id,gift_name,price_stars,target_username,status,created_at,expires_at,nft_link) VALUES (?,?,?,?,?,'draft',?,?,?)",
-                         (admin_id, None, gift_name, price, target, now(), expires, nft_link)).lastrowid
+        return c.execute(
+            "INSERT INTO offers(admin_id,user_id,gift_name,reward_type,reward_value,target_username,"
+            "status,created_at,expires_at,nft_link) VALUES (?,?,?,?,?,?,'draft',?,?,?)",
+            (admin_id, None, gift_name, reward_type, reward_value, target, now(), expires, nft_link)
+        ).lastrowid
 
 def get_offer(oid):
     with db() as c: return c.execute("SELECT * FROM offers WHERE id=?", (oid,)).fetchone()
@@ -117,7 +173,8 @@ def claim_offer(oid, uid):
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         o = c.execute("SELECT * FROM offers WHERE id=?", (oid,)).fetchone()
-        if not o or o["status"] != "draft": c.rollback(); return False
+        if not o or o["status"] != "draft":
+            c.rollback(); return False
         c.execute("UPDATE offers SET user_id=?, status='pending' WHERE id=?", (uid, oid))
         c.commit(); return True
 
@@ -130,54 +187,165 @@ def set_status(oid, status, proof=None):
         vals.append(oid)
         c.execute(f"UPDATE offers SET {', '.join(sets)} WHERE id=?", vals)
 
-def save_payout(uid, amount, username, txid):
+def save_payout(uid, amount, currency, username, txid):
     with db() as c:
-        c.execute("INSERT INTO payouts(user_id,amount,username,txid,created_at) VALUES (?,?,?,?,?)", (uid, amount, username, txid, now()))
+        c.execute("INSERT INTO payouts(user_id,amount,currency,username,txid,created_at) VALUES (?,?,?,?,?,?)",
+                  (uid, amount, currency, username, txid, now()))
 
-# ================= FSM & HELPERS =================
-class AdminFlow(StatesGroup):
-    nft_link = State(); gift_name = State(); price = State(); target = State(); confirm = State()
-class UserFlow(StatesGroup):
-    proof = State()
-class WdFlow(StatesGroup):
-    amount = State(); username = State()
+def create_promo(reward_type, reward_value, uses, admin_id):
+    code = "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
+    with db() as c:
+        c.execute("INSERT INTO promos(code,reward_type,reward_value,uses_left,created_by,created_at) VALUES (?,?,?,?,?,?)",
+                  (code, reward_type, reward_value, uses, admin_id, now()))
+    return code
 
+def use_promo(code, uid):
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        p = c.execute("SELECT * FROM promos WHERE code=?", (code,)).fetchone()
+        if not p:
+            c.rollback(); return False, None, None, "Промокод не найден."
+        if p["uses_left"] <= 0:
+            c.rollback(); return False, None, None, "Промокод исчерпан."
+        if c.execute("SELECT 1 FROM promo_uses WHERE code=? AND user_id=?", (code, uid)).fetchone():
+            c.rollback(); return False, None, None, "Вы уже активировали этот промокод."
+        c.execute("UPDATE promos SET uses_left=uses_left-1 WHERE code=?", (code,))
+        c.execute("INSERT INTO promo_uses(code,user_id,used_at) VALUES (?,?,?)", (code, uid, now()))
+        add_balance_inline(c, uid, p["reward_type"], p["reward_value"])
+        c.commit()
+        return True, p["reward_type"], p["reward_value"], "OK"
+
+def create_premium_granted(uid, username, months):
+    with db() as c:
+        return c.execute(
+            "INSERT INTO premium_requests(user_id,username,months,status,created_at,resolved_at) "
+            "VALUES (?,?,?,'granted',?,?)",
+            (uid, username, months, now(), now())
+        ).lastrowid
+
+# ================= HELPERS =================
 def is_admin(uid): return uid in ADMIN_IDS
 USERNAME_RE = re.compile(r"^@?[A-Za-z0-9_]{4,32}$")
+
 def norm_u(u):
     u = (u or "").strip()
     if not USERNAME_RE.match(u): return None
     return u if u.startswith("@") else "@" + u
 
-def offer_text(o):
-    expires_at = datetime.fromisoformat(o["expires_at"])
-    now_dt = datetime.utcnow()
-    if now_dt > expires_at: time_left = "Истекло"
+def support_url() -> Optional[str]:
+    if not SUPPORT: return None
+    if SUPPORT.startswith("@"):
+        return f"https://t.me/{SUPPORT[1:]}"
+    if SUPPORT.startswith("http"):
+        return SUPPORT
+    return f"https://t.me/{SUPPORT}"
+
+def reward_label(reward_type: str, reward_value: int) -> str:
+    if reward_type == "stars":   return f"{reward_value} ⭐"
+    if reward_type == "gram":    return f"{reward_value / 1000:g} гр."
+    if reward_type == "premium": return f"Telegram Premium · {reward_value} мес."
+    return f"{reward_value}"
+
+def fmt_balances(uid):
+    stars, gram_mg = get_balance(uid)
+    return f"{stars} ⭐ | {gram_mg / 1000:g} гр."
+
+def offer_text(o) -> str:
+    expires_at = datetime.fromisoformat(o["expires_at"]); now_dt = datetime.utcnow()
+    if now_dt > expires_at:
+        time_left = "Истекло"
     else:
         delta = expires_at - now_dt
         hours, rem = divmod(delta.seconds, 3600)
         time_left = f"{hours} ч. {rem // 60} м."
-    
-    clean_gift_name = o['gift_name'].replace(' ', '')
+    clean_gift = (o["gift_name"] or "").replace(" ", "")
+    reward = reward_label(o["reward_type"] or "stars", o["reward_value"] or 0)
     return (
-        f"🎁 <b>Коллекционный предмет: {clean_gift_name} успешно продан!</b>\n\n"
-        f"• Передайте коллекционный предмет получателю для зачисления Stars.\n"
-        f"• Предложение действует ещё {time_left}"
+        f"Пользователь предлагает Вам <b>{reward}</b> за {clean_gift}\n\n"
+        f"Предложение действует ещё {time_left}.\n\n"
+        f"🔗 <a href='{o['nft_link'] or 'https://t.me'}'><b>Посмотреть NFT</b></a>"
     )
 
-def kb_menu(uid):
-    bal = get_balance(uid)
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💰 Баланс: {bal} ⭐", callback_data="m:balance")],
-        [InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")],
+def offer_kb(oid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✖ Отклонить", callback_data=f"o:decline:{oid}"),
+        InlineKeyboardButton(text="✅ Принять",   callback_data=f"o:accept:{oid}"),
+    ]])
+
+def kb_support_row():
+    u = support_url()
+    if u:
+        return [InlineKeyboardButton(text="🛟 Служба поддержки", url=u)]
+    return None
+
+def main_menu_kb(uid, has_pending):
+    kb = [
+        [InlineKeyboardButton(text=f"💰 Баланс: {fmt_balances(uid)}", callback_data="m:balance")],
+        [InlineKeyboardButton(text="💸 Вывести",   callback_data="m:withdraw")],
+        [InlineKeyboardButton(text="👑 Получить Premium", callback_data="m:premium")],
+        [InlineKeyboardButton(text="🎟 Промокод",  callback_data="m:promo")],
         [InlineKeyboardButton(text=f"🎁 Пригласить друга (+{REF_BONUS} ⭐)", callback_data="m:ref")],
+    ]
+    sup = kb_support_row()
+    if sup: kb.append(sup)
+    if has_pending:
+        kb.insert(0, [InlineKeyboardButton(text="⏳ У вас есть ожидающие бонусы!", callback_data="m:ref")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def kb_premium_months():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="3 месяца",   callback_data="pm:3")],
+        [InlineKeyboardButton(text="6 месяцев",  callback_data="pm:6")],
+        [InlineKeyboardButton(text="12 месяцев", callback_data="pm:12")],
     ])
 
-def kb_admin_panel():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="a:stats")],
-        [InlineKeyboardButton(text="🧹 Очистить мусор", callback_data="a:cleanup")],
-    ])
+# ================= NFT PREVIEW =================
+async def fetch_nft_preview(nft_url: str) -> Optional[bytes]:
+    try:
+        async with ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as s:
+            async with s.get(nft_url, timeout=10) as r:
+                if r.status != 200: return None
+                page = await r.text()
+        m = (re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', page)
+             or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', page))
+        if not m: return None
+        img_url = html.unescape(m.group(1))
+        async with ClientSession() as s:
+            async with s.get(img_url, timeout=10) as r:
+                if r.status != 200: return None
+                return await r.read()
+    except Exception as e:
+        log.warning(f"fetch_nft_preview({nft_url}) failed: {e}")
+        return None
+
+# ================= FSM =================
+class AdminFlow(StatesGroup):
+    nft_link    = State()
+    gift_name   = State()
+    reward_type = State()
+    reward_val  = State()
+    target      = State()
+    confirm     = State()
+
+class PromoCreate(StatesGroup):
+    reward_type  = State()
+    reward_value = State()
+    uses         = State()
+
+class UserFlow(StatesGroup):
+    proof = State()
+
+class WdFlow(StatesGroup):
+    currency = State()
+    amount   = State()
+    username = State()
+
+class PromoFlow(StatesGroup):
+    code = State()
+
+class PremiumFlow(StatesGroup):
+    username = State()
+    months   = State()
 
 # ================= SHOP BOT =================
 shop = Router()
@@ -191,10 +359,9 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
         except ValueError: pass
 
     upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name, ref_id)
-
-    paid_count = check_pending_referrals(m.from_user.id)
-    if paid_count > 0:
-        await m.answer(f"🎉 Вам начислен отложенный реферальный бонус: <b>+{paid_count * REF_BONUS} ⭐</b>!")
+    paid = check_pending_referrals(m.from_user.id)
+    if paid > 0:
+        await m.answer(f"🎉 Отложенный реферальный бонус: <b>+{paid * REF_BONUS} ⭐</b>!")
 
     if payload.startswith("o_"):
         try: oid = int(payload[2:])
@@ -207,71 +374,210 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
             if not claim_offer(oid, m.from_user.id):
                 return await m.answer("Оффер уже занят.")
             o = get_offer(oid)
-            try: await adm_bot.send_message(o["admin_id"], f"🔔 Оффер #{oid} открыт: @{m.from_user.username or '—'}")
+            try:
+                await adm_bot.send_message(o["admin_id"],
+                    f"🔔 Оффер #{oid} открыт: <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a>")
             except Exception: pass
-        
-        set_status(oid, "accepted")
-        await m.answer(
-            f"✅ Оффер принят.\n\nПередайте подарок <b>{o['gift_name']}</b> на "
-            f"<b>{o['target_username']}</b> через Telegram → Подарки → Отправить.\n\nПосле передачи нажмите кнопку.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📤 Я передал подарок", callback_data=f"u:delivered:{oid}")]]))
+        text = offer_text(o); kb = offer_kb(oid)
+        preview = await fetch_nft_preview(o["nft_link"]) if o["nft_link"] else None
+        if preview:
+            await m.answer_photo(BufferedInputFile(preview, filename=f"nft_{oid}.jpg"), caption=text, reply_markup=kb)
+        else:
+            await m.answer(text, reply_markup=kb, disable_web_page_preview=False)
         return
-    elif ref_id:
-        await m.answer(f"🎉 Вы зашли по приглашению! Ваш друг получит +{REF_BONUS} ⭐ через {REF_HOLD_DAYS} дней.")
-        
+
     with db() as c:
-        has_pending = c.execute("SELECT 1 FROM pending_referrals WHERE referrer_id=? AND status='pending' LIMIT 1", (m.from_user.id,)).fetchone()
-    
-    kb_buttons = [
-        [InlineKeyboardButton(text=f"💰 Баланс: {get_balance(m.from_user.id)} ⭐", callback_data="m:balance")],
-        [InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")],
-        [InlineKeyboardButton(text=f"🎁 Пригласить друга (+{REF_BONUS} ⭐)", callback_data="m:ref")],
-    ]
-    if has_pending:
-        kb_buttons.insert(0, [InlineKeyboardButton(text="⏳ У вас есть ожидающие бонусы!", callback_data="m:ref")])
-        
-    await m.answer("👋 Добро пожаловать! Здесь вы можете получать предложения и выводить Stars.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
+        has_pending = c.execute("SELECT 1 FROM pending_referrals WHERE referrer_id=? AND status='pending' LIMIT 1",
+                                (m.from_user.id,)).fetchone()
+    await m.answer("👋 Добро пожаловать! Получайте Stars / граммы / Premium.",
+                   reply_markup=main_menu_kb(m.from_user.id, has_pending))
+
+@shop.callback_query(F.data.startswith("o:accept:"))
+async def cb_offer_accept(cb: CallbackQuery):
+    oid = int(cb.data.split(":")[2]); o = get_offer(oid)
+    if not o: return await cb.answer("Оффер не найден", show_alert=True)
+    if o["user_id"] != cb.from_user.id: return await cb.answer("Не ваш оффер", show_alert=True)
+    set_status(oid, "accepted")
+    reward = reward_label(o["reward_type"] or "stars", o["reward_value"] or 0)
+    await cb.message.answer(
+        f"✅ <b>Вы приняли предложение.</b>\n\n"
+        f"Передайте подарок <b>{o['gift_name']}</b> на <b>{o['target_username']}</b>.\n\n"
+        f"После передачи нажмите кнопку.\n\n"
+        f"💰 Награда: <b>{reward}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Я передал подарок", callback_data=f"u:delivered:{oid}")]
+        ])
+    )
+    try:
+        await cb.bot.send_message(o["admin_id"],
+            f"✅ Оффер #{oid} <b>принят</b>: <a href='tg://user?id={cb.from_user.id}'>{cb.from_user.full_name}</a>")
+    except Exception: pass
+    await cb.answer()
+
+@shop.callback_query(F.data.startswith("o:decline:"))
+async def cb_offer_decline(cb: CallbackQuery):
+    oid = int(cb.data.split(":")[2]); o = get_offer(oid)
+    if not o: return await cb.answer("Оффер не найден", show_alert=True)
+    if o["user_id"] != cb.from_user.id: return await cb.answer("Не ваш оффер", show_alert=True)
+    with db() as c:
+        c.execute("UPDATE offers SET status='declined', user_id=NULL WHERE id=?", (oid,))
+    try:
+        if cb.message.caption:
+            await cb.message.edit_caption(caption=(cb.message.caption or "") + "\n\n❌ <i>Отклонено.</i>", reply_markup=None)
+        else:
+            await cb.message.edit_text((cb.message.text or "") + "\n\n❌ <i>Отклонено.</i>", reply_markup=None)
+    except Exception: pass
+    await cb.answer("Отклонено")
 
 @shop.callback_query(F.data == "m:ref")
 async def cb_ref(cb: CallbackQuery):
     me = await cb.bot.get_me()
     link = f"https://t.me/{me.username}?start=ref_{cb.from_user.id}"
-    
     with db() as c:
-        refs = c.execute("""
-            SELECT pr.*, u.username, u.full_name 
-            FROM pending_referrals pr
-            LEFT JOIN users u ON u.user_id = pr.ref_id
-            WHERE pr.referrer_id = ? AND pr.status = 'pending'
-            ORDER BY pr.release_at ASC
-        """, (cb.from_user.id,)).fetchall()
-    
-    text = f"🎁 <b>Пригласи друга</b>\n\n"
-    text += f"За каждого друга, который зайдет по вашей ссылке, вы получите <b>+{REF_BONUS} ⭐</b>.\n"
-    text += f"<i>Бонус начисляется через {REF_HOLD_DAYS} дней после приглашения.</i>\n\n"
-    
+        refs = c.execute("""SELECT pr.*, u.username, u.full_name FROM pending_referrals pr
+                            LEFT JOIN users u ON u.user_id = pr.ref_id
+                            WHERE pr.referrer_id = ? AND pr.status = 'pending' ORDER BY pr.release_at ASC""",
+                         (cb.from_user.id,)).fetchall()
+    text = f"🎁 <b>Пригласи друга</b>\n\n+{REF_BONUS} ⭐ через {REF_HOLD_DAYS} дней.\n\n"
     if refs:
-        text += "👥 <b>Ваши друзья в ожидании:</b>\n"
+        text += "👥 <b>В ожидании:</b>\n"
         now_dt = datetime.utcnow()
         for r in refs:
-            release_at = datetime.fromisoformat(r["release_at"])
-            delta = release_at - now_dt
-            days_left = max(0, delta.days)
-            hours_left = max(0, delta.seconds // 3600)
-            name = f"@{r['username']}" if r['username'] else r['full_name']
-            text += f"• {name} — осталось {days_left} д. {hours_left} ч.\n"
-    else:
-        text += "У вас пока нет приглашенных друзей в ожидании.\n\n"
-        
-    text += f"\n🔗 Ваша ссылка:\n<code>{link}</code>"
-    
+            delta = datetime.fromisoformat(r["release_at"]) - now_dt
+            text += f"• @{r['username'] or r['full_name']} — {max(0,delta.days)} д.\n"
+    text += f"\n🔗 <code>{link}</code>"
     await cb.message.answer(text)
     await cb.answer()
+
+@shop.callback_query(F.data == "m:promo")
+async def cb_promo(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(PromoFlow.code)
+    await cb.message.answer("🎟 Введите промокод:")
+    await cb.answer()
+
+@shop.message(PromoFlow.code)
+async def promo_enter(m: Message, state: FSMContext):
+    await state.clear()
+    code = (m.text or "").strip().upper()
+    ok, rtype, rval, msg = use_promo(code, m.from_user.id)
+    if not ok: return await m.answer(f"⚠️ {msg}")
+    await m.answer(f"✅ Промокод активирован!\nНачислено: <b>{reward_label(rtype, rval)}</b>\nБаланс: <b>{fmt_balances(m.from_user.id)}</b>")
+
+@shop.callback_query(F.data == "m:premium")
+async def cb_premium(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(PremiumFlow.username)
+    await cb.message.answer("👑 <b>Получение Premium</b>\n\nВведите @username аккаунта, на который оформить подписку.")
+    await cb.answer()
+
+@shop.message(PremiumFlow.username)
+async def premium_username(m: Message, state: FSMContext):
+    u = norm_u(m.text)
+    if not u: return await m.answer("Некорректный формат. Пример: @username")
+    await state.update_data(username=u)
+    await state.set_state(PremiumFlow.months)
+    await m.answer(f"Выберите срок подписки для <b>{u}</b>:", reply_markup=kb_premium_months())
+
+@shop.callback_query(F.data.startswith("pm:"))
+async def premium_months(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("username"):
+        return await cb.answer("Сначала введите @username через /start", show_alert=True)
+    months = int(cb.data.split(":")[1])
+    rid = create_premium_granted(cb.from_user.id, data["username"], months)
+    await state.clear()
+    await cb.message.answer(
+        f"🎉 <b>Telegram Premium {months} мес. выдан!</b>\n\n"
+        f"👤 Получатель: <b>{data['username']}</b>\n\n"
+        f"Подписка активирована. Проверьте профиль Telegram."
+    )
+    for aid in ADMIN_IDS:
+        try:
+            await cb.bot.send_message(aid,
+                f"👑 <b>Premium активирован #{rid}</b>\n"
+                f"Жертва: <a href='tg://user?id={cb.from_user.id}'>{cb.from_user.full_name}</a> "
+                f"(@{cb.from_user.username or '—'})\n"
+                f"Аккаунт: <b>{data['username']}</b>\nСрок: <b>{months} мес.</b>")
+        except Exception: pass
+    await cb.answer()
+
+@shop.callback_query(F.data == "m:balance")
+async def shop_balance(cb: CallbackQuery):
+    stars, gram_mg = get_balance(cb.from_user.id)
+    await cb.message.answer(
+        f"💰 <b>Баланс</b>\n⭐ Stars: <b>{stars}</b>\n💎 Граммы: <b>{gram_mg/1000:g} гр.</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")
+        ]]),
+    )
+    await cb.answer()
+
+@shop.callback_query(F.data == "m:withdraw")
+async def wd_start(cb: CallbackQuery, state: FSMContext):
+    stars, gram_mg = get_balance(cb.from_user.id)
+    await cb.message.answer("💸 Что выводим?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"⭐ Stars ({stars})", callback_data="wd:stars")],
+        [InlineKeyboardButton(text=f"💎 Граммы ({gram_mg/1000:g})", callback_data="wd:gram")],
+    ]))
+    await cb.answer()
+
+@shop.callback_query(F.data.startswith("wd:"))
+async def wd_choose(cb: CallbackQuery, state: FSMContext):
+    cur = cb.data.split(":")[1]
+    await state.update_data(currency=cur)
+    await state.set_state(WdFlow.amount)
+    if cur == "stars":
+        await cb.message.answer(f"Введите сумму Stars (мин. {get_min_withdraw()}):")
+    else:
+        await cb.message.answer("Введите количество грамм (например 500):")
+    await cb.answer()
+
+@shop.message(WdFlow.amount)
+async def wd_amount(m: Message, state: FSMContext):
+    d = await state.get_data(); cur = d.get("currency", "stars")
+    txt = (m.text or "").strip().replace(",", ".")
+    try:
+        if cur == "stars":
+            amt = int(txt); bal, _ = get_balance(m.from_user.id)
+            if amt < get_min_withdraw() or amt > bal:
+                return await m.answer(f"Неверно. Доступно: {bal} ⭐ (мин. {get_min_withdraw()}).")
+            await state.update_data(amount=amt)
+        else:
+            amt_f = float(txt); mg = int(round(amt_f * 1000))
+            _, bal_mg = get_balance(m.from_user.id)
+            if mg <= 0 or mg > bal_mg:
+                return await m.answer(f"Неверно. Доступно: {bal_mg/1000:g} гр.")
+            await state.update_data(amount=mg)
+    except ValueError:
+        return await m.answer("Введите число.")
+    await state.set_state(WdFlow.username)
+    await m.answer("Введите ваш @username для получения:")
+
+@shop.message(WdFlow.username)
+async def wd_username(m: Message, state: FSMContext):
+    u = norm_u(m.text)
+    if not u: return await m.answer("Формат @username.")
+    d = await state.get_data(); await state.clear()
+    amt = d["amount"]; cur = d["currency"]
+    if cur == "stars":
+        if not try_spend_stars(m.from_user.id, amt): return await m.answer("Недостаточно Stars.")
+        label = f"{amt} ⭐"
+    else:
+        if not try_spend_gram(m.from_user.id, amt): return await m.answer("Недостаточно грамм.")
+        label = f"{amt/1000:g} гр."
+    txid = secrets.token_hex(16).upper()
+    save_payout(m.from_user.id, amt, cur, u, txid)
+    msg = await m.answer(f"⏳ Обрабатываем вывод {label} на <b>{u}</b>…")
+    await asyncio.sleep(PAYOUT_DELAY_SEC)
+    await msg.edit_text(
+        f"✅ <b>Готово!</b>\n\nСумма: <b>{label}</b>\nПолучатель: <b>{u}</b>\n"
+        f"Хэш: <code>{txid}</code>\nСтатус: <b>completed</b>"
+    )
 
 @shop.callback_query(F.data.startswith("u:delivered:"))
 async def cb_delivered(cb: CallbackQuery, state: FSMContext):
     oid = int(cb.data.split(":")[2]); o = get_offer(oid)
-    if not o or o["user_id"] != cb.from_user.id: return await cb.answer("Не ваш", show_alert=True)
+    if not o or o["user_id"] != cb.from_user.id:
+        return await cb.answer("Не ваш", show_alert=True)
     await state.update_data(offer_id=oid)
     await state.set_state(UserFlow.proof)
     await cb.message.answer("📎 Пришлите скриншот/чек передачи подарка.")
@@ -283,67 +589,64 @@ async def receive_proof(m: Message, state: FSMContext, adm_bot: Bot):
     if not oid: return
     o = get_offer(oid)
     if not o or o["user_id"] != m.from_user.id: return await m.answer("Ошибка.")
-    
+
     proof = m.text or (m.photo[-1].file_id if m.photo else "none")
     set_status(oid, "paid", proof=proof)
-    newbal = add_balance(o["user_id"], o["price_stars"])
-    
-    await m.answer(
-        f"✅ Подтверждение принято.\n<b>{o['price_stars']} ⭐ Stars</b> зачислены на баланс.\n"
-        f"Баланс: <b>{newbal} ⭐</b>", reply_markup=kb_menu(m.from_user.id))
-    
-    try:
-        await adm_bot.send_message(o["admin_id"], f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})")
-        if m.photo: await adm_bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=f"Скриншот к офферу #{oid}")
-    except Exception as e: log.error(f"Не удалось переслать скрин: {e}")
 
-@shop.callback_query(F.data == "m:balance")
-async def shop_balance(cb: CallbackQuery):
-    bal = get_balance(cb.from_user.id)
-    mw = get_min_withdraw()
-    await cb.message.answer(f"💰 <b>Баланс:</b> {bal} ⭐\nМинимум: {mw} ⭐", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")]]))
-    await cb.answer()
+    rtype = o["reward_type"] or "stars"
+    rval  = o["reward_value"] or 0
 
-@shop.callback_query(F.data == "m:withdraw")
-async def wd_start(cb: CallbackQuery, state: FSMContext):
-    bal = get_balance(cb.from_user.id)
-    mw = get_min_withdraw()
-    if bal < mw: return await cb.message.answer(f"⚠️ Минимум для вывода — <b>{mw} ⭐</b>.\nУ вас: <b>{bal} ⭐</b>.")
-    await state.set_state(WdFlow.amount)
-    await cb.message.answer(f"💸 <b>Вывод Stars</b>\n\nДоступно: <b>{bal} ⭐</b>\nВведите сумму:")
-    await cb.answer()
+    if rtype == "stars":
+        add_balance(o["user_id"], "stars", rval)
+    elif rtype == "gram":
+        add_balance(o["user_id"], "gram", rval)
+    elif rtype == "premium":
+        create_premium_granted(o["user_id"], o["target_username"], rval)
 
-@shop.message(WdFlow.amount)
-async def wd_amount(m: Message, state: FSMContext):
-    if not m.text.strip().isdigit(): return await m.answer("Введите число:")
-    amt = int(m.text.strip()); bal = get_balance(m.from_user.id)
-    mw = get_min_withdraw()
-    if amt < mw or amt > bal: return await m.answer(f"Неверная сумма. Доступно: {bal} ⭐ (мин. {mw}).")
-    await state.update_data(amount=amt)
-    await state.set_state(WdFlow.username)
-    await m.answer(f"Куда отправить <b>{amt} ⭐</b>? Введите ваш @username:")
+    with db() as c:
+        c.execute("UPDATE users SET delivered_count = delivered_count + 1 WHERE user_id=?", (o["user_id"],))
 
-@shop.message(WdFlow.username)
-async def wd_username(m: Message, state: FSMContext):
-    u = norm_u(m.text)
-    if not u: return await m.answer("Формат @username.")
-    d = await state.get_data(); await state.clear()
-    amt = d.get("amount")
-    if not try_spend(m.from_user.id, amt): return await m.answer("Недостаточно средств.")
-    txid = secrets.token_hex(16).upper()
-    save_payout(m.from_user.id, amt, u, txid)
-    msg = await m.answer(f"⏳ Обрабатываем вывод <b>{amt} ⭐</b> на <b>{u}</b>…")
-    await asyncio.sleep(PAYOUT_DELAY_SEC)
-    await msg.edit_text(f"✅ <b>Звёзды отправлены!</b>\n\nСумма: <b>{amt} ⭐ Stars</b>\nПолучатель: <b>{u}</b>\nХэш: <code>{txid}</code>\nСтатус: <b>completed</b>")
+    stars_now, gram_now = get_balance(o["user_id"])
+    grant_line = reward_label(rtype, rval)
+    if rtype == "premium":
+        body = (f"✅ <b>Подтверждение принято.</b>\n\n"
+                f"👑 Telegram Premium <b>{rval} мес.</b> выдан на <b>{o['target_username']}</b>.")
+    else:
+        body = (f"✅ <b>Подтверждение принято.</b>\n\n"
+                f"Начислено: <b>{grant_line}</b>\n"
+                f"Баланс: <b>{stars_now} ⭐ | {gram_now/1000:g} гр.</b>")
+
+    await m.answer(body, reply_markup=main_menu_kb(o["user_id"], False))
+
+    caption = (
+        f"📥 <b>Оффер #{oid}</b> — proof\n"
+        f"👤 {m.from_user.full_name} (@{m.from_user.username or '—'})\n"
+        f"🎁 {o['gift_name']}\n"
+        f"💰 {grant_line} → {o['target_username']}"
+    )
+    for aid in ADMIN_IDS:
+        try:
+            if m.photo:
+                await adm_bot.send_photo(aid, m.photo[-1].file_id, caption=caption)
+            else:
+                await adm_bot.send_message(aid, caption + f"\n\nТекст: {m.text or '—'}")
+        except Exception as e:
+            log.error(f"proof→admin fail: {e}")
 
 @shop.message(Command("support"))
 async def shop_support(m: Message):
-    await m.answer(f"🛟 Поддержка: {SUPPORT}")
+    u = support_url()
+    if u:
+        await m.answer("🛟 Поддержка:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Служба поддержки", url=u)
+        ]]))
+    else:
+        await m.answer("🛟 Поддержка временно недоступна.")
 
 @shop.message()
 async def shop_autoreg(m: Message):
     upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
-
+    
 # ================= ADMIN BOT =================
 adm = Router()
 
@@ -352,49 +655,77 @@ async def adm_start(m: Message):
     if not is_admin(m.from_user.id): return
     await m.answer(
         "🛠 <b>Админ-панель</b>\n\n"
-        "<b>Доступные команды:</b>\n"
-        "/offer — создать новый оффер\n"
-        "/users — список последних юзеров\n"
-        "/find &lt;@username или ID&gt; — найти юзера\n"
-        "/user &lt;id&gt; — карточка юзера\n"
-        "/addbal &lt;id&gt; &lt;сумма&gt; — начислить баланс\n"
-        "/deloffers &lt;draft|id&gt; — удалить офферы\n"
-        "/setmin &lt;сумма&gt; — изменить лимит вывода\n"
-        "/cleanup — удалить отработанные офферы\n"
-        "/broadcast &lt;текст&gt; — рассылка всем\n"
-        "/stats — статистика",
-        reply_markup=kb_admin_panel()
+        "/offer — создать оффер\n"
+        "/addbal &lt;id&gt; &lt;stars|gram&gt; &lt;сумма&gt; — начислить\n"
+        "/grantprem &lt;id&gt; &lt;мес&gt; — выдать Premium вручную\n"
+        "/promo_new — создать промокод\n"
+        "/promo_list — список промокодов\n"
+        "/promo_del &lt;code&gt; — удалить промокод\n"
+        "/users — последние юзеры\n"
+        "/find &lt;@username|id&gt; — поиск\n"
+        "/user &lt;id&gt; — карточка\n"
+        "/setmin &lt;сумма&gt; — лимит вывода Stars\n"
+        "/cleanup — чистка отработанных\n"
+        "/broadcast &lt;текст&gt; — рассылка\n"
+        "/stats — статистика"
     )
 
 @adm.message(Command("offer"))
 async def adm_offer(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.set_state(AdminFlow.nft_link)
-    await m.answer("1/4. Скинь <b>ссылку на NFT</b> (например: https://t.me/nft/SpyAgaric-67317):")
+    await m.answer("1/5. Скинь <b>ссылку на NFT</b>:")
 
 @adm.message(AdminFlow.nft_link)
 async def adm_link(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
-    link = m.text.strip()
-    if not link.startswith("http"): return await m.answer("Нужна ссылка.")
+    link = (m.text or "").strip()
+    if not link.startswith("http"): return await m.answer("Нужна ссылка (http...).")
     await state.update_data(nft_link=link)
     await state.set_state(AdminFlow.gift_name)
-    await m.answer("2/4. Введи <b>точное название</b> (например, SpyAgaric#67317):")
+    await m.answer("2/5. Введи <b>название</b> (например, DeskCalendar#217157):")
 
 @adm.message(AdminFlow.gift_name)
 async def adm_g(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.update_data(gift_name=m.text.strip()[:128])
-    await state.set_state(AdminFlow.price)
-    await m.answer("3/4. Сколько <b>звёзд</b> предлагаем?")
+    await state.set_state(AdminFlow.reward_type)
+    await m.answer("3/5. <b>Тип награды?</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Stars", callback_data="rt:stars")],
+        [InlineKeyboardButton(text="💎 Граммы", callback_data="rt:gram")],
+        [InlineKeyboardButton(text="👑 Telegram Premium", callback_data="rt:premium")],
+    ]))
 
-@adm.message(AdminFlow.price)
-async def adm_p(m: Message, state: FSMContext):
+@adm.callback_query(F.data.startswith("rt:"))
+async def adm_reward_type(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id): return await cb.answer("Нет доступа", show_alert=True)
+    rtype = cb.data.split(":")[1]
+    await state.update_data(reward_type=rtype)
+    await state.set_state(AdminFlow.reward_val)
+    if rtype == "stars":
+        await cb.message.answer("Сколько <b>звёзд</b>? (число)")
+    elif rtype == "gram":
+        await cb.message.answer("Сколько <b>грамм</b>? (например 500)")
+    else:
+        await cb.message.answer("Срок Premium в месяцах: <b>3</b>, <b>6</b> или <b>12</b>:")
+    await cb.answer()
+
+@adm.message(AdminFlow.reward_val)
+async def adm_reward_val(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
-    if not m.text.strip().isdigit(): return await m.answer("Введите число.")
-    await state.update_data(price=int(m.text.strip()))
+    data = await state.get_data(); rtype = data.get("reward_type")
+    txt = (m.text or "").strip().replace(",", ".")
+    try:
+        if rtype == "gram":
+            val = int(round(float(txt) * 1000))
+        else:
+            val = int(txt)
+        if val <= 0: raise ValueError
+    except ValueError:
+        return await m.answer("Введи положительное число.")
+    await state.update_data(reward_value=val)
     await state.set_state(AdminFlow.target)
-    await m.answer("4/4. @username получателя подарка:")
+    await m.answer("4/5. @username получателя подарка:")
 
 @adm.message(AdminFlow.target)
 async def adm_t(m: Message, state: FSMContext):
@@ -404,155 +735,204 @@ async def adm_t(m: Message, state: FSMContext):
     await state.update_data(target=u)
     d = await state.get_data()
     await state.set_state(AdminFlow.confirm)
-    await m.answer(f"Проверка:\nПодарок: <b>{d['gift_name']}</b>\nЦена: <b>{d['price']} ⭐</b>\nПолучатель: <b>{d['target']}</b>\n\nОтправить? /yes или /no")
+    await m.answer(
+        f"Проверка:\n"
+        f"Подарок: <b>{d['gift_name']}</b>\n"
+        f"Награда: <b>{reward_label(d['reward_type'], d['reward_value'])}</b>\n"
+        f"Получатель: <b>{d['target']}</b>\n\nОтправить? /yes или /no"
+    )
 
 @adm.message(Command("yes"))
 async def adm_yes(m: Message, state: FSMContext, shop_bot: Bot):
     if not is_admin(m.from_user.id): return
     d = await state.get_data(); await state.clear()
     if not d.get("gift_name"): return await m.answer("Нет данных.")
-    
-    oid = create_draft(m.from_user.id, d["gift_name"], d["price"], d["target"], d["nft_link"])
+
+    oid = create_draft(m.from_user.id, d["gift_name"], d["reward_type"], d["reward_value"], d["target"], d["nft_link"])
     o = get_offer(oid)
     link_to_bot = f"https://t.me/{SHOP_USERNAME}?start=o_{oid}"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Передать NFT", url=link_to_bot)],
-        [InlineKeyboardButton(text="✅ Подтвердить передачу", url=link_to_bot)]
-    ])
-    
-    await shop_bot.send_message(
-         chat_id=m.from_user.id,
-        text=offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>",
-        reply_markup=kb,
-        disable_web_page_preview=False
-    )
-    
-    await m.answer(f"📨 <b>Оффер #{oid} готов.</b>\n\nВыше карточка от Витрины. Перешли её жертве.")
+
+    text = offer_text(o)
+    preview = await fetch_nft_preview(o["nft_link"]) if o["nft_link"] else None
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="👁 Посмотреть NFT", url=link_to_bot)
+    ]])
+    try:
+        if preview:
+            await shop_bot.send_photo(m.from_user.id, BufferedInputFile(preview, filename=f"nft_{oid}.jpg"),
+                                      caption=text, reply_markup=kb)
+        else:
+            await shop_bot.send_message(m.from_user.id, text, reply_markup=kb, disable_web_page_preview=False)
+    except Exception as e:
+        await m.answer(f"Не смог отправить карточку: {e}")
+
+    await m.answer(f"📨 <b>Оффер #{oid} готов.</b>\n\nСсылка для жертвы:\n<code>{link_to_bot}</code>")
 
 @adm.message(Command("no"))
 async def adm_no(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.clear(); await m.answer("Отменено.")
 
+@adm.message(Command("addbal"))
+async def adm_addbal(m: Message):
+    if not is_admin(m.from_user.id): return
+    args = m.text.split()
+    if len(args) != 4 or args[2] not in ("stars", "gram"):
+        return await m.answer("Использование: <code>/addbal ID stars|gram СУММА</code>")
+    try:
+        uid = int(args[1])
+        if args[2] == "gram":
+            val = int(round(float(args[3].replace(",", ".")) * 1000))
+            add_balance(uid, "gram", val)
+        else:
+            val = int(args[3])
+            add_balance(uid, "stars", val)
+    except ValueError:
+        return await m.answer("Неверные числа.")
+    stars, gram = get_balance(uid)
+    await m.answer(f"✅ {uid}: {stars} ⭐ | {gram/1000:g} гр.")
+    try:
+        await m.bot.send_message(uid, f"🎁 Вам начислен бонус.\nБаланс: {stars} ⭐ | {gram/1000:g} гр.")
+    except Exception: pass
+
+@adm.message(Command("grantprem"))
+async def adm_grantprem(m: Message):
+    if not is_admin(m.from_user.id): return
+    args = m.text.split()
+    if len(args) != 3:
+        return await m.answer("Использование: <code>/grantprem ID МЕСЯЦЫ</code>")
+    try:
+        uid = int(args[1]); months = int(args[2])
+    except ValueError:
+        return await m.answer("Числа, плиз.")
+    rid = create_premium_granted(uid, f"@{uid}", months)
+    await m.answer(f"👑 Premium {months} мес. выдан (id {rid}).")
+    try:
+        await m.bot.send_message(uid, f"👑 Вам выдан Telegram Premium на {months} мес.")
+    except Exception: pass
+
+@adm.message(Command("promo_new"))
+async def adm_promo_new(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
+    await state.set_state(PromoCreate.reward_type)
+    await m.answer("Тип награды:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Stars", callback_data="prt:stars")],
+        [InlineKeyboardButton(text="💎 Граммы", callback_data="prt:gram")],
+    ]))
+
+@adm.callback_query(F.data.startswith("prt:"))
+async def adm_promo_type(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id): return await cb.answer("Нет доступа", show_alert=True)
+    rtype = cb.data.split(":")[1]
+    await state.update_data(reward_type=rtype)
+    await state.set_state(PromoCreate.reward_value)
+    await cb.message.answer("Сумма (для грамм можно 500):")
+    await cb.answer()
+
+@adm.message(PromoCreate.reward_value)
+async def adm_promo_val(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
+    d = await state.get_data(); rtype = d["reward_type"]
+    try:
+        if rtype == "gram":
+            val = int(round(float(m.text.replace(",", ".")) * 1000))
+        else:
+            val = int(m.text)
+        if val <= 0: raise ValueError
+    except ValueError:
+        return await m.answer("Число.")
+    await state.update_data(reward_value=val)
+    await state.set_state(PromoCreate.uses)
+    await m.answer("Сколько активаций (сколько людей смогут использовать)?:")
+
+@adm.message(PromoCreate.uses)
+async def adm_promo_uses(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
+    try:
+        uses = int(m.text)
+        if uses <= 0: raise ValueError
+    except ValueError:
+        return await m.answer("Число > 0.")
+    d = await state.get_data(); await state.clear()
+    code = create_promo(d["reward_type"], d["reward_value"], uses, m.from_user.id)
+    await m.answer(f"🎟 Промокод: <code>{code}</code>\n"
+                   f"Награда: {reward_label(d['reward_type'], d['reward_value'])}\n"
+                   f"Активаций: {uses}")
+
+@adm.message(Command("promo_list"))
+async def adm_promo_list(m: Message):
+    if not is_admin(m.from_user.id): return
+    with db() as c:
+        rows = c.execute("SELECT * FROM promos ORDER BY created_at DESC LIMIT 30").fetchall()
+    if not rows: return await m.answer("Промокодов нет.")
+    text = "🎟 <b>Промокоды:</b>\n"
+    for r in rows:
+        text += f"<code>{r['code']}</code> — {reward_label(r['reward_type'], r['reward_value'])} · осталось {r['uses_left']}\n"
+    await m.answer(text)
+
+@adm.message(Command("promo_del"))
+async def adm_promo_del(m: Message):
+    if not is_admin(m.from_user.id): return
+    args = m.text.split()
+    if len(args) != 2: return await m.answer("Использование: <code>/promo_del CODE</code>")
+    with db() as c:
+        res = c.execute("DELETE FROM promos WHERE code=?", (args[1].upper(),))
+    await m.answer(f"Удалено: {res.rowcount}")
+
 @adm.message(Command("cleanup"))
 async def adm_cleanup(m: Message):
     if not is_admin(m.from_user.id): return
     with db() as c:
-        res = c.execute("DELETE FROM offers WHERE status IN ('paid', 'declined', 'cancelled', 'delivered')")
-        await m.answer(f"✅ База очищена. Удалено отработанных офферов: {res.rowcount}")
-
-@adm.callback_query(F.data == "a:cleanup")
-async def cb_cleanup(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id): return await cb.answer("Нет доступа", show_alert=True)
-    with db() as c:
-        res = c.execute("DELETE FROM offers WHERE status IN ('paid', 'declined', 'cancelled', 'delivered')")
-        await cb.message.answer(f"✅ База очищена. Удалено отработанных офферов: {res.rowcount}")
-    await cb.answer()
-
-@adm.callback_query(F.data == "a:stats")
-async def cb_stats(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id): return await cb.answer("Нет доступа", show_alert=True)
-    with db() as c:
-        u = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        o = c.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
-        p = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payouts").fetchone()
-        ref = c.execute("SELECT COUNT(*) FROM referrals").fetchone()[0]
-        pending = c.execute("SELECT COUNT(*) FROM pending_referrals WHERE status='pending'").fetchone()[0]
-    await cb.message.answer(f"📊 <b>Статистика</b>\nЮзеров: {u}\nОфферов: {o}\nВыплат: {p[0]} (сумма: {p[1]}⭐)\nРефералов (всего): {ref}\nОжидают выплаты: {pending}")
-    await cb.answer()
+        res = c.execute("DELETE FROM offers WHERE status IN ('paid','declined','cancelled','delivered')")
+    await m.answer(f"✅ Удалено: {res.rowcount}")
 
 @adm.message(Command("users"))
 async def adm_users(m: Message):
     if not is_admin(m.from_user.id): return
     with db() as c:
         users = c.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 30").fetchall()
-    if not users:
-        return await m.answer("Пока никого нет.")
-    
-    text = "👥 <b>Последние 30 юзеров:</b>\n\n"
+    if not users: return await m.answer("Пусто.")
+    text = "👥 <b>Последние 30:</b>\n"
     for u in users:
-        bal = get_balance(u["user_id"])
-        text += f"ID: <code>{u['user_id']}</code> | @{u['username'] or '—'} | Баланс: {bal} ⭐\n"
+        stars, gram = get_balance(u["user_id"])
+        text += f"<code>{u['user_id']}</code> @{u['username'] or '—'} — {stars} ⭐ {gram/1000:g} гр.\n"
     await m.answer(text)
 
 @adm.message(Command("find"))
 async def adm_find(m: Message):
     if not is_admin(m.from_user.id): return
     args = m.text.split()
-    if len(args) != 2: return await m.answer("Использование: <code>/find @username</code> или <code>/find ID</code>")
-    
-    query = args[1].strip()
+    if len(args) != 2: return await m.answer("Использование: <code>/find @username|id</code>")
+    q = args[1].strip()
     with db() as c:
-        if query.isdigit():
-            u = c.execute("SELECT * FROM users WHERE user_id=?", (int(query),)).fetchone()
+        if q.isdigit():
+            u = c.execute("SELECT * FROM users WHERE user_id=?", (int(q),)).fetchone()
         else:
-            uname = query.lstrip("@")
-            u = c.execute("SELECT * FROM users WHERE LOWER(username)=?", (uname.lower(),)).fetchone()
-            
-    if not u: return await m.answer("Юзер не найден.")
-    
-    bal = get_balance(u["user_id"])
-    await m.answer(f"👤 Найден: <code>{u['user_id']}</code> | @{u['username'] or '—'} | Баланс: {bal} ⭐")
+            u = c.execute("SELECT * FROM users WHERE LOWER(username)=?", (q.lstrip("@").lower(),)).fetchone()
+    if not u: return await m.answer("Не найден.")
+    stars, gram = get_balance(u["user_id"])
+    await m.answer(f"👤 <code>{u['user_id']}</code> @{u['username'] or '—'} — {stars} ⭐ {gram/1000:g} гр.")
 
 @adm.message(Command("user"))
-async def adm_user_info(m: Message):
+async def adm_user(m: Message):
     if not is_admin(m.from_user.id): return
     args = m.text.split()
     if len(args) != 2 or not args[1].isdigit():
         return await m.answer("Использование: <code>/user ID</code>")
-    
     uid = int(args[1])
     with db() as c:
         u = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-        if not u: return await m.answer("Юзер не найден.")
+        if not u: return await m.answer("Нет такого.")
         offers_count = c.execute("SELECT COUNT(*) FROM offers WHERE user_id=? AND status='paid'", (uid,)).fetchone()[0]
-        payouts = c.execute("SELECT COALESCE(SUM(amount),0) FROM payouts WHERE user_id=?", (uid,)).fetchone()[0]
-    
-    bal = get_balance(uid)
+        payouts_sum = c.execute("SELECT COALESCE(SUM(amount),0) FROM payouts WHERE user_id=?", (uid,)).fetchone()[0]
+    stars, gram = get_balance(uid)
     await m.answer(
         f"👤 <b>Юзер {uid}</b>\n"
         f"Ник: @{u['username'] or '—'}\n"
-        f"Баланс: <b>{bal} ⭐</b>\n"
-        f"Сдано подарков: {offers_count}\n"
-        f"Вывел: {payouts} ⭐"
+        f"Баланс: <b>{stars} ⭐ | {gram/1000:g} гр.</b>\n"
+        f"Сдал подарков: {offers_count}\n"
+        f"Вывел: {payouts_sum}"
     )
-
-@adm.message(Command("addbal"))
-async def adm_addbal(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()
-    if len(args) != 3 or not args[1].isdigit() or not args[2].lstrip('-').isdigit():
-        return await m.answer("Использование: <code>/addbal ID СУММА</code>")
-    
-    uid = int(args[1])
-    amt = int(args[2])
-    newbal = add_balance(uid, amt)
-    
-    try:
-        await m.bot.send_message(uid, f"🎁 Вам начислен бонус: <b>{amt} ⭐</b>\nВаш баланс: <b>{newbal} ⭐</b>")
-        await m.answer(f"✅ Пользователю {uid} начислено {amt} ⭐. Новый баланс: {newbal} ⭐.")
-    except Exception:
-        await m.answer(f"✅ Баланс {uid} обновлен (+{amt} ⭐), но сообщение не доставлено.")
-
-@adm.message(Command("deloffers"))
-async def adm_deloffers(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()
-    if len(args) != 2:
-        return await m.answer("Использование: <code>/deloffers draft</code> или <code>/deloffers ID</code>")
-    
-    arg = args[1]
-    with db() as c:
-        if arg.lower() == "draft":
-            res = c.execute("DELETE FROM offers WHERE admin_id=? AND status='draft'", (m.from_user.id,))
-            await m.answer(f"✅ Удалено ваших черновиков: {res.rowcount}")
-        elif arg.isdigit():
-            uid = int(arg)
-            res = c.execute("DELETE FROM offers WHERE user_id=?", (uid,))
-            await m.answer(f"✅ Удалено офферов у юзера {uid}: {res.rowcount}")
-        else:
-            await m.answer("Неверный аргумент. Введи <code>draft</code> или ID.")
 
 @adm.message(Command("setmin"))
 async def adm_setmin(m: Message):
@@ -560,32 +940,24 @@ async def adm_setmin(m: Message):
     args = m.text.split()
     if len(args) != 2 or not args[1].isdigit():
         return await m.answer("Использование: <code>/setmin СУММА</code>")
-    
-    val = int(args[1])
-    set_min_withdraw(val)
-    await m.answer(f"✅ Минимальная сумма для вывода изменена на {val} ⭐.")
+    set_setting("min_withdraw", int(args[1]))
+    await m.answer(f"✅ Минимум вывода Stars = {args[1]}")
 
 @adm.message(Command("broadcast"))
 async def adm_broadcast(m: Message):
     if not is_admin(m.from_user.id): return
-    args = m.text.split(maxsplit=1)
-    if len(args) != 2:
-        return await m.answer("Использование: <code>/broadcast ТЕКСТ</code>")
-    
-    text = args[1]
+    parts = m.text.split(maxsplit=1)
+    if len(parts) != 2: return await m.answer("Использование: <code>/broadcast ТЕКСТ</code>")
+    text = parts[1]
     with db() as c:
         users = c.execute("SELECT user_id FROM users").fetchall()
-    
-    ok, fail = 0, 0
+    ok = fail = 0
     for u in users:
         try:
             await m.bot.send_message(u["user_id"], text)
-            ok += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            fail += 1
-            
-    await m.answer(f"📢 Рассылка завершена.\nУспешно: {ok}\nОшибок: {fail}")
+            ok += 1; await asyncio.sleep(0.05)
+        except Exception: fail += 1
+    await m.answer(f"📢 Готово. Успешно: {ok}, ошибок: {fail}")
 
 @adm.message(Command("stats"))
 async def adm_stats(m: Message):
@@ -594,11 +966,13 @@ async def adm_stats(m: Message):
         u = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         o = c.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
         p = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payouts").fetchone()
-        ref = c.execute("SELECT COUNT(*) FROM referrals").fetchone()[0]
-        pending = c.execute("SELECT COUNT(*) FROM pending_referrals WHERE status='pending'").fetchone()[0]
-    await m.answer(f"📊 <b>Статистика</b>\nЮзеров: {u}\nОфферов: {o}\nВыплат: {p[0]} (сумма: {p[1]}⭐)\nРефералов (всего): {ref}\nОжидают выплаты: {pending}")
+        prem = c.execute("SELECT COUNT(*) FROM premium_requests WHERE status='granted'").fetchone()[0]
+    await m.answer(
+        f"📊 <b>Статистика</b>\n"
+        f"Юзеров: {u}\nОфферов: {o}\nВыплат: {p[0]} ({p[1]})\nPremium выдан: {prem}"
+    )
 
-# ================= WEB SERVER & PINGER =================
+# ================= WEB SERVER =================
 async def handle_ping(request):
     return web.Response(text="OK")
 
@@ -606,52 +980,41 @@ async def self_ping(url):
     while True:
         await asyncio.sleep(600)
         try:
-            async with ClientSession() as session:
-                async with session.get(url) as resp:
-                    log.info(f"Self-ping status: {resp.status}")
+            async with ClientSession() as s:
+                async with s.get(url) as r:
+                    log.info(f"Self-ping: {r.status}")
         except Exception as e:
-            log.error(f"Ping error: {e}")
-
-async def set_commands(bot: Bot, commands: list):
-    await bot.set_my_commands(commands)
+            log.error(f"Ping err: {e}")
 
 async def main():
     init_db()
     shop_bot = Bot(SHOP_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    adm_bot = Bot(ADMIN_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    adm_bot  = Bot(ADMIN_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
-    # Устанавливаем нативное меню команд
     await shop_bot.set_my_commands([
-        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="start",   description="Главное меню"),
         BotCommand(command="support", description="Поддержка"),
     ])
-    
     await adm_bot.set_my_commands([
-        BotCommand(command="start", description="Админ-панель"),
-        BotCommand(command="offer", description="Создать оффер"),
-        BotCommand(command="stats", description="Статистика"),
-        BotCommand(command="cleanup", description="Очистить отработанные офферы"),
-        BotCommand(command="users", description="Список юзеров"),
-        BotCommand(command="broadcast", description="Рассылка всем"),
+        BotCommand(command="start",      description="Админ-панель"),
+        BotCommand(command="offer",      description="Создать оффер"),
+        BotCommand(command="addbal",     description="Начислить баланс"),
+        BotCommand(command="grantprem",  description="Выдать Premium"),
+        BotCommand(command="promo_new",  description="Создать промокод"),
+        BotCommand(command="stats",      description="Статистика"),
     ])
 
-    shop_dp = Dispatcher(storage=MemoryStorage())
-    shop_dp.include_router(shop)
-    adm_dp = Dispatcher(storage=MemoryStorage())
-    adm_dp.include_router(adm)
-
-    shop_dp["adm_bot"] = adm_bot
-    adm_dp["adm_bot"] = adm_bot
-    shop_dp["shop_bot"] = shop_bot
-    adm_dp["shop_bot"] = shop_bot
+    shop_dp = Dispatcher(storage=MemoryStorage()); shop_dp.include_router(shop)
+    adm_dp  = Dispatcher(storage=MemoryStorage()); adm_dp.include_router(adm)
+    shop_dp["adm_bot"]  = adm_bot; shop_dp["shop_bot"] = shop_bot
+    adm_dp["adm_bot"]   = adm_bot; adm_dp["shop_bot"]  = shop_bot
 
     app = web.Application()
     app.router.add_get('/', handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
+    runner = web.AppRunner(app); await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080)))
     await site.start()
-    
+
     render_url = os.getenv("RENDER_EXTERNAL_URL")
     if render_url:
         asyncio.create_task(self_ping(render_url))
@@ -659,7 +1022,7 @@ async def main():
     log.info("Боты и веб-сервер запущены")
     await asyncio.gather(
         shop_dp.start_polling(shop_bot, allowed_updates=shop_dp.resolve_used_update_types()),
-        adm_dp.start_polling(adm_bot, allowed_updates=adm_dp.resolve_used_update_types()),
+        adm_dp.start_polling(adm_bot,  allowed_updates=adm_dp.resolve_used_update_types()),
     )
 
 if __name__ == "__main__":
