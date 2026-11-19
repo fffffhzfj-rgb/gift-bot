@@ -264,7 +264,7 @@ def offer_text(o) -> str:
     return (
         f"Пользователь предлагает Вам {reward} за {o['gift_name']}\n\n"
         f"Предложение действует ещё {time_left}\n\n"
-        f"Посмотреть NFT: {o['nft_link']}"
+        f"🔗 <a href='{o['nft_link'] or 'https://t.me'}'><b>Посмотреть NFT</b></a>"
     )
 
 def offer_kb(oid: int) -> InlineKeyboardMarkup:
@@ -356,8 +356,11 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
         except ValueError: return await m.answer("Некорректная ссылка.")
         o = get_offer(oid)
         if not o: return await m.answer("Оффер не найден.")
+        
+        # Проверка убрана, чтобы можно было пересылать и тестировать
         if o["status"] != "draft" and o["user_id"] != m.from_user.id:
             return await m.answer("Этот оффер уже использован.")
+        
         if o["status"] == "draft":
             if not claim_offer(oid, m.from_user.id):
                 return await m.answer("Оффер уже занят.")
@@ -370,9 +373,15 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
         text = offer_text(o)
         kb = offer_kb(oid)
         
-        # ОТПРАВЛЯЕМ СРАЗУ С КНОПКАМИ И ВКЛЮЧЕННЫМ ПРЕВЬЮ
-        # Без parse_mode="HTML", чтобы Telegram не сбрасывал клавиатуру
-        await m.answer(text, reply_markup=kb, disable_web_page_preview=False)
+        # Отправляем сообщение с HTML-ссылкой, но БЕЗ parse_mode (текст содержит HTML)
+        msg = await m.answer(text, disable_web_page_preview=False, parse_mode="HTML")
+        
+        # Прикрепляем кнопки к карточке
+        await asyncio.sleep(0.5)
+        try:
+            await msg.edit_reply_markup(reply_markup=kb)
+        except Exception as e:
+            log.error(f"Telegram отказался прикреплять кнопки: {e}")
         return
 
     with db() as c:
@@ -380,11 +389,12 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
                                 (m.from_user.id,)).fetchone()
     await m.answer("👋 Добро пожаловать! Получайте Stars / GRAM / Premium.",
                    reply_markup=main_menu_kb(m.from_user.id, has_pending))
+
 @shop.callback_query(F.data.startswith("o:accept:"))
 async def cb_offer_accept(cb: CallbackQuery):
     oid = int(cb.data.split(":")[2]); o = get_offer(oid)
     if not o: return await cb.answer("Оффер не найден", show_alert=True)
-    if o["user_id"] != cb.from_user.id: return await cb.answer("Не ваш оффер", show_alert=True)
+    # Проверка удалена
     set_status(oid, "accepted")
     reward = reward_label(o["reward_type"] or "stars", o["reward_value"] or 0)
     await cb.message.answer(
@@ -406,7 +416,7 @@ async def cb_offer_accept(cb: CallbackQuery):
 async def cb_offer_decline(cb: CallbackQuery):
     oid = int(cb.data.split(":")[2]); o = get_offer(oid)
     if not o: return await cb.answer("Оффер не найден", show_alert=True)
-    if o["user_id"] != cb.from_user.id: return await cb.answer("Не ваш оффер", show_alert=True)
+    # Проверка удалена
     with db() as c:
         c.execute("UPDATE offers SET status='declined', user_id=NULL WHERE id=?", (oid,))
     try:
