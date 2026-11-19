@@ -168,6 +168,13 @@ def norm_u(u):
     if not USERNAME_RE.match(u): return None
     return u if u.startswith("@") else "@" + u
 
+def fmt_price(price, currency):
+    price_val = f"{price:g}" if isinstance(price, float) else str(price)
+    if currency == 'stars': return f"{price_val} ⭐"
+    if currency == 'gram': return f"{price_val} GRAM"
+    if currency == 'premium': return f"{price_val} мес. Premium"
+    return f"{price_val} {currency.upper()}"
+
 def offer_text(o):
     expires_at = datetime.fromisoformat(o["expires_at"])
     now_dt = datetime.now(timezone.utc)
@@ -177,8 +184,7 @@ def offer_text(o):
         hours, rem = divmod(delta.seconds, 3600)
         time_left = f"{hours} ч. {rem // 60} м."
 
-    curr = o['currency']
-    price_str = f"{o['price_stars']:g} ⭐" if curr == 'stars' else (f"{o['price_stars']:g} GRAM" if curr == 'gram' else f"{o['price_stars']:g} Premium")
+    price_str = fmt_price(o['price_stars'], o['currency'])
 
     return (
         f"Пользователь предлагает Вам {price_str} за {o['gift_name']}\n\n"
@@ -190,7 +196,7 @@ def kb_menu(uid):
     bal_gram = get_balance(uid, 'gram')
     bal_prem = get_balance(uid, 'premium')
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💰 Баланс: {bal_stars:g} ⭐ | {bal_gram:g} GRAM | {bal_prem:g} Prem", callback_data="m:balance")],
+        [InlineKeyboardButton(text=f"💰 Баланс: {bal_stars:g} ⭐ | {bal_gram:g} GRAM | {bal_prem:g} мес. Prem", callback_data="m:balance")],
         [InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw"), InlineKeyboardButton(text="📜 История", callback_data="m:hist")],
         [InlineKeyboardButton(text=f"🎁 Пригласить друга (+{REF_BONUS} ⭐)", callback_data="m:ref")],
         [InlineKeyboardButton(text="🆔 Мой ID", callback_data="m:myid"), InlineKeyboardButton(text="🛟 Поддержка", url=f"https://t.me/{SUPPORT.replace('@','')}")]
@@ -274,11 +280,11 @@ async def cb_hist(cb: CallbackQuery):
     if offers:
         text += "<b>Офферы:</b>\n"
         for o in offers:
-            text += f"• #{o['id']} {o['gift_name']} — {o['price_stars']:g} {o['currency'].upper()} [{o['status']}]\n"
+            text += f"• #{o['id']} {o['gift_name']} — {fmt_price(o['price_stars'], o['currency'])} [{o['status']}]\n"
     if payouts:
         text += "\n<b>Выплаты:</b>\n"
         for p in payouts:
-            text += f"• {p['amount']:g} {p['currency'].upper()} на {p['username']} — <code>{p['txid'][:10]}…</code>\n"
+            text += f"• {fmt_price(p['amount'], p['currency'])} на {p['username']} — <code>{p['txid'][:10]}…</code>\n"
     if not offers and not payouts:
         text += "Пусто."
     await cb.message.answer(text)
@@ -341,7 +347,7 @@ async def receive_proof(m: Message, state: FSMContext, adm_bot: Bot):
     
     await m.answer("✅ Скриншот отправлен на проверку. Ожидайте.")
 
-    caption = f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})\n\nПодарок: {o['gift_name']}\nСумма: {o['price_stars']:g} {o['currency'].upper()}"
+    caption = f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})\n\nПодарок: {o['gift_name']}\nСумма: {fmt_price(o['price_stars'], o['currency'])}"
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Выдать звёзды", callback_data=f"a:proof:approve:{oid}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"a:proof:reject:{oid}")]
@@ -356,6 +362,11 @@ async def receive_proof(m: Message, state: FSMContext, adm_bot: Bot):
             await adm_bot.send_message(o["admin_id"], caption + f"\n\n<b>Текст:</b>\n{m.text}", reply_markup=kb)
     except Exception as e:
         log.error(f"Не удалось переслать proof: {e}")
+        # fallback — шлём текст, если медиа не прошло
+        try:
+            await adm_bot.send_message(o["admin_id"], caption + f"\n\n(Не удалось переслать файл)", reply_markup=kb)
+        except Exception as e2:
+            log.error(f"Fallback failed: {e2}")
 
 @shop.callback_query(F.data == "m:balance")
 async def shop_balance(cb: CallbackQuery):
@@ -411,7 +422,7 @@ async def wd_amount(m: Message, state: FSMContext):
 
     await state.update_data(amount=amt)
     await state.set_state(WdFlow.username)
-    await m.answer(f"Куда отправить <b>{amt:g} {curr.upper()}</b>? Введите ваш @username:")
+    await m.answer(f"Куда отправить <b>{fmt_price(amt, curr)}</b>? Введите ваш @username:")
 
 @shop.message(WdFlow.username)
 async def wd_username(m: Message, state: FSMContext):
@@ -424,9 +435,9 @@ async def wd_username(m: Message, state: FSMContext):
     if not try_spend(m.from_user.id, curr, amt): return await m.answer("Недостаточно средств.")
     txid = secrets.token_hex(16).upper()
     save_payout(m.from_user.id, amt, curr, u, txid)
-    msg = await m.answer(f"⏳ Обрабатываем вывод <b>{amt:g} {curr.upper()}</b> на <b>{u}</b>…")
+    msg = await m.answer(f"⏳ Обрабатываем вывод <b>{fmt_price(amt, curr)}</b> на <b>{u}</b>…")
     await asyncio.sleep(PAYOUT_DELAY_SEC)
-    await msg.edit_text(f"✅ <b>Средства отправлены!</b>\n\nСумма: <b>{amt:g} {curr.upper()}</b>\nПолучатель: <b>{u}</b>\nХэш: <code>{txid}</code>\nСтатус: <b>completed</b>")
+    await msg.edit_text(f"✅ <b>Средства отправлены!</b>\n\nСумма: <b>{fmt_price(amt, curr)}</b>\nПолучатель: <b>{u}</b>\nХэш: <code>{txid}</code>\nСтатус: <b>completed</b>")
 
 @shop.message(Command("support"))
 async def shop_support(m: Message):
@@ -497,7 +508,7 @@ async def adm_t(m: Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Отправить", callback_data="a:confirm_yes"), InlineKeyboardButton(text="❌ Отмена", callback_data="a:confirm_no")]
     ])
-    await m.answer(f"Проверка:\nПодарок: <b>{d['gift_name']}</b>\nЦена: <b>{d['price']:g} {d['currency'].upper()}</b>\nПолучатель: <b>{u}</b>\n\nВсе верно?", reply_markup=kb)
+    await m.answer(f"Проверка:\nПодарок: <b>{d['gift_name']}</b>\nЦена: <b>{fmt_price(d['price'], d['currency'])}</b>\nПолучатель: <b>{u}</b>\n\nВсе верно?", reply_markup=kb)
 
 @adm.callback_query(F.data == "a:confirm_yes")
 async def adm_confirm_yes(cb: CallbackQuery, state: FSMContext, shop_bot: Bot):
@@ -634,10 +645,10 @@ async def cb_addbal_amount(m: Message, state: FSMContext):
     amt = float(m.text) if d['currency'] in ['gram', 'stars'] else int(m.text)
 
     newbal = add_balance(d['uid'], d['currency'], amt)
-    await m.answer(f"✅ Пользователю {d['uid']} начислено {amt:g} {d['currency'].upper()}.\nБаланс: {newbal:g}", reply_markup=kb_admin_panel())
+    await m.answer(f"✅ Пользователю {d['uid']} начислено {fmt_price(amt, d['currency'])}.\nБаланс: {newbal:g}", reply_markup=kb_admin_panel())
 
     try:
-        await m.bot.send_message(d['uid'], f"🎁 Вам начислен бонус: <b>{amt:g} {d['currency'].upper()}</b>\nВаш баланс: <b>{newbal:g}</b>")
+        await m.bot.send_message(d['uid'], f"🎁 Вам начислен бонус: <b>{fmt_price(amt, d['currency'])}</b>\nВаш баланс: <b>{newbal:g}</b>")
     except: pass
 
 @adm.callback_query(F.data == "a:users")
@@ -735,7 +746,7 @@ async def cb_proof_approve(cb: CallbackQuery):
     set_status(oid, "paid")
     newbal = add_balance(o["user_id"], o["currency"], o["price_stars"])
     try:
-        await cb.bot.send_message(o["user_id"], f"✅ Ваш оффер #{oid} подтвержден.\nНачислено: <b>{o['price_stars']:g} {o['currency'].upper()}</b>\nБаланс: <b>{newbal:g}</b>")
+        await cb.bot.send_message(o["user_id"], f"✅ Ваш оффер #{oid} подтвержден.\nНачислено: <b>{fmt_price(o['price_stars'], o['currency'])}</b>\nБаланс: <b>{newbal:g}</b>")
     except: pass
     await cb.message.edit_reply_markup(reply_markup=None)
     await cb.answer("Начислено.")
@@ -780,7 +791,7 @@ async def cb_offers_by_status(cb: CallbackQuery):
         
     text = f"🗂 <b>Офферы {status}:</b>\n\n"
     for o in offers:
-        text += f"#{o['id']} | {o['gift_name']} | {o['price_stars']:g} {o['currency'].upper()} | UID: {o['user_id'] or '-'}\n"
+        text += f"#{o['id']} | {o['gift_name']} | {fmt_price(o['price_stars'], o['currency'])} | UID: {o['user_id'] or '-'}\n"
     
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Назад", callback_data="a:offers_menu")]])
     await cb.message.edit_text(text, reply_markup=kb)
