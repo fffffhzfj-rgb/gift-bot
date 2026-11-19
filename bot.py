@@ -14,7 +14,6 @@ from aiogram.types import (
     BotCommand, BufferedInputFile,
 )
 
-# ================= ENV =================
 SHOP_TOKEN     = os.getenv("SHOP_TOKEN", "PASTE_SHOP_TOKEN")
 ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "PASTE_ADMIN_TOKEN")
 ADMIN_IDS      = {int(x) for x in os.getenv("ADMIN_IDS", "123").split(",") if x.strip().isdigit()}
@@ -31,7 +30,6 @@ REF_HOLD_DAYS        = 7
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dual")
 
-# ================= DB =================
 def db():
     c = sqlite3.connect(DB_PATH); c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL"); return c
@@ -223,7 +221,6 @@ def create_premium_granted(uid, username, months):
             (uid, username, months, now(), now())
         ).lastrowid
 
-# ================= HELPERS =================
 def is_admin(uid): return uid in ADMIN_IDS
 USERNAME_RE = re.compile(r"^@?[A-Za-z0-9_]{4,32}$")
 
@@ -300,7 +297,6 @@ def kb_premium_months():
         [InlineKeyboardButton(text="12 месяцев", callback_data="pm:12")],
     ])
 
-# ================= FSM =================
 class AdminFlow(StatesGroup):
     nft_link    = State()
     gift_name   = State()
@@ -334,9 +330,7 @@ class PromoFlow(StatesGroup):
 class PremiumFlow(StatesGroup):
     username = State()
     months   = State()
-    
-# ================= SHOP BOT =================
-shop = Router()
+    shop = Router()
 
 @shop.message(Command("start"))
 async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
@@ -357,7 +351,6 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
         o = get_offer(oid)
         if not o: return await m.answer("Оффер не найден.")
         
-        # Проверка убрана, чтобы можно было пересылать и тестировать
         if o["status"] != "draft" and o["user_id"] != m.from_user.id:
             return await m.answer("Этот оффер уже использован.")
         
@@ -373,10 +366,7 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
         text = offer_text(o)
         kb = offer_kb(oid)
         
-        # Отправляем сообщение с HTML-ссылкой, но БЕЗ parse_mode (текст содержит HTML)
         msg = await m.answer(text, disable_web_page_preview=False, parse_mode="HTML")
-        
-        # Прикрепляем кнопки к карточке
         await asyncio.sleep(0.5)
         try:
             await msg.edit_reply_markup(reply_markup=kb)
@@ -394,7 +384,6 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
 async def cb_offer_accept(cb: CallbackQuery):
     oid = int(cb.data.split(":")[2]); o = get_offer(oid)
     if not o: return await cb.answer("Оффер не найден", show_alert=True)
-    # Проверка удалена
     set_status(oid, "accepted")
     reward = reward_label(o["reward_type"] or "stars", o["reward_value"] or 0)
     await cb.message.answer(
@@ -416,7 +405,6 @@ async def cb_offer_accept(cb: CallbackQuery):
 async def cb_offer_decline(cb: CallbackQuery):
     oid = int(cb.data.split(":")[2]); o = get_offer(oid)
     if not o: return await cb.answer("Оффер не найден", show_alert=True)
-    # Проверка удалена
     with db() as c:
         c.execute("UPDATE offers SET status='declined', user_id=NULL WHERE id=?", (oid,))
     try:
@@ -644,9 +632,7 @@ async def shop_support(m: Message):
 @shop.message()
 async def shop_autoreg(m: Message):
     upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
-    
-# ================= ADMIN BOT =================
-adm = Router()
+    adm = Router()
 
 def adm_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -671,7 +657,6 @@ async def adm_back_to_main(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=adm_main_kb())
     await cb.answer()
 
-# ================= ОФФЕР =================
 @adm.callback_query(F.data == "adm:offer")
 async def adm_btn_offer(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AdminFlow.nft_link)
@@ -764,8 +749,8 @@ async def adm_yes(cb: CallbackQuery, state: FSMContext, shop_bot: Bot):
     link_to_bot = f"https://t.me/{SHOP_USERNAME}?start=o_{oid}"
 
     text = offer_text(o)
-    
     try:
+        # Отправляем WebApp-карточку через витрину
         msg = await shop_bot.send_message(cb.from_user.id, text, disable_web_page_preview=False, parse_mode="HTML")
         await asyncio.sleep(0.5)
         await msg.edit_reply_markup(reply_markup=offer_kb(oid))
@@ -774,7 +759,6 @@ async def adm_yes(cb: CallbackQuery, state: FSMContext, shop_bot: Bot):
     await cb.message.edit_text(f"📨 <b>Оффер #{oid} готов.</b>\n\nСсылка для жертвы:\n<code>{link_to_bot}</code>", reply_markup=adm_main_kb())
     await cb.answer("Создан")
 
-# ================= НАЧИСЛИТЬ / PREMIUM / РАССЫЛКА (КНОПКИ) =================
 @adm.callback_query(F.data == "adm:addbal")
 async def adm_btn_addbal(cb: CallbackQuery, state: FSMContext):
     with db() as c:
@@ -829,7 +813,6 @@ async def adm_addbal_amount(m: Message, state: FSMContext):
     try: await m.bot.send_message(uid, f"🎁 Вам начислен бонус!\nБаланс: {stars} ⭐ | {gram/1000:g} GRAM")
     except Exception: pass
 
-# --- Premium ---
 @adm.callback_query(F.data == "adm:grantprem")
 async def adm_btn_grantprem(cb: CallbackQuery, state: FSMContext):
     with db() as c:
@@ -896,11 +879,9 @@ async def adm_action_handler(m: Message, state: FSMContext):
 
 @adm.message(AdminFlow.target)
 async def adm_input_handler(m: Message, state: FSMContext):
-    # Заглушка если что-то прилетело не туда
     await state.clear()
     await m.answer("Действие отменено.", reply_markup=adm_main_kb())
 
-# ================= ПРОМО =================
 @adm.callback_query(F.data == "adm:promos")
 async def adm_btn_promos(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -982,7 +963,6 @@ async def adm_promo_uses(m: Message, state: FSMContext):
     code = create_promo(d["reward_type"], d["reward_value"], uses, m.from_user.id)
     await m.answer(f"🎟 Промокод: <code>{code}</code>\nНаграда: {reward_label(d['reward_type'], d['reward_value'])}\nАктиваций: {uses}", reply_markup=adm_main_kb())
 
-# ================= ЮЗЕРЫ / СТАТИСТИКА / ОЧИСТКА =================
 @adm.callback_query(F.data == "adm:users")
 async def adm_btn_users(cb: CallbackQuery):
     with db() as c:
@@ -1012,7 +992,6 @@ async def adm_btn_cleanup(cb: CallbackQuery):
     await cb.answer(f"✅ Удалено: {res.rowcount}", show_alert=True)
     await cb.message.edit_text("🧹 <b>База очищена.</b>", reply_markup=adm_main_kb())
 
-# ================= WEB SERVER =================
 async def handle_ping(request):
     return web.Response(text="OK")
 
