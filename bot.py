@@ -28,7 +28,6 @@ REF_HOLD_DAYS = 7
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dual")
 
-# ================= DB =================
 def db():
     c = sqlite3.connect(DB_PATH); c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL"); return c
@@ -148,7 +147,6 @@ def save_payout(uid, amount, currency, username, txid):
     with db() as c:
         c.execute("INSERT INTO payouts(user_id,amount,currency,username,txid,created_at) VALUES (?,?,?,?,?,?)", (uid, amount, currency, username, txid, now()))
 
-# ================= FSM & HELPERS =================
 class AdminFlow(StatesGroup):
     nft_link = State(); gift_name = State(); price = State(); currency = State(); target = State(); confirm = State()
     broadcast = State(); setmin = State(); addbal_id = State(); addbal_amount = State(); addbal_currency = State()
@@ -201,7 +199,6 @@ def kb_admin_panel():
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="a:broadcast"), InlineKeyboardButton(text="🧹 Очистить мусор", callback_data="a:cleanup")],
     ])
 
-# ================= SHOP BOT =================
 shop = Router()
 
 @shop.message(Command("start"))
@@ -320,8 +317,7 @@ async def receive_proof(m: Message, state: FSMContext, adm_bot: Bot):
         await adm_bot.send_message(o["admin_id"], f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})")
         if m.photo: await adm_bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=f"Скриншот к офферу #{oid}")
     except Exception as e: log.error(f"Не удалось переслать скрин: {e}")
-
-@shop.callback_query(F.data == "m:balance")
+    @shop.callback_query(F.data == "m:balance")
 async def shop_balance(cb: CallbackQuery):
     bal_s = get_balance(cb.from_user.id, 'stars')
     bal_g = get_balance(cb.from_user.id, 'gram')
@@ -406,7 +402,10 @@ adm = Router()
 @adm.message(Command("start"))
 async def adm_start(m: Message):
     if not is_admin(m.from_user.id): return
-    async def adm_create_offer(cb: CallbackQuery, state: FSMContext):
+    await m.answer("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=kb_admin_panel())
+
+@adm.callback_query(F.data == "a:create_offer")
+async def adm_create_offer(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
     await cb.message.edit_text("1/5. Скинь <b>ссылку на NFT</b>:")
     await state.set_state(AdminFlow.nft_link)
@@ -476,7 +475,6 @@ async def adm_confirm_yes(cb: CallbackQuery, state: FSMContext, shop_bot: Bot):
         [InlineKeyboardButton(text="✅ Подтвердить передачу", url=link_to_bot)]
     ])
     
-    # Отправляем от лица Витрины
     await shop_bot.send_message(
         chat_id=cb.from_user.id,
         text=offer_text(o) + f"\n\n<a href='{o['nft_link']}'>Посмотреть NFT</a>",
@@ -490,7 +488,6 @@ async def adm_confirm_no(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.edit_text("Отменено.", reply_markup=kb_admin_panel())
 
-# --- Кнопки управления ---
 @adm.callback_query(F.data == "a:stats")
 async def cb_stats(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return await cb.answer("Нет доступа", show_alert=True)
