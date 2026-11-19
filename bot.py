@@ -24,7 +24,6 @@ PAYOUT_DELAY_SEC = 7
 OFFER_TTL_HOURS = 6
 REF_BONUS = 500
 REF_HOLD_DAYS = 7
-USERS_PER_PAGE = 10
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dual")
@@ -155,6 +154,7 @@ class AdminFlow(StatesGroup):
     broadcast = State(); setmin = State()
     addbal_search = State(); addbal_amount = State(); addbal_currency = State()
     send_offer_user = State(); send_offer_link = State(); send_offer_name = State(); send_offer_price = State(); send_offer_curr = State(); send_offer_target = State()
+    reject_reason = State()
 
 class UserFlow(StatesGroup):
     proof = State()
@@ -204,6 +204,7 @@ def kb_admin_panel():
         [InlineKeyboardButton(text="💰 Начислить баланс", callback_data="a:addbal"), InlineKeyboardButton(text="⚙️ Лимит вывода", callback_data="a:setmin")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="a:broadcast"), InlineKeyboardButton(text="🧹 Очистить мусор", callback_data="a:cleanup")],
         [InlineKeyboardButton(text="🗂 Офферы по статусу", callback_data="a:offers_menu")],
+        [InlineKeyboardButton(text="🎲 Генератор ников", callback_data="a:nickgen")]
     ])
 
 # ================= SHOP =================
@@ -336,22 +337,23 @@ async def receive_proof(m: Message, state: FSMContext, adm_bot: Bot):
     if not o or o["user_id"] != m.from_user.id: return await m.answer("Ошибка.")
 
     proof = m.text or (m.photo[-1].file_id if m.photo else (m.document.file_id if m.document else "none"))
-    set_status(oid, "paid", proof=proof)
-    curr = o['currency']
-    newbal = add_balance(o["user_id"], curr, o["price_stars"])
+    set_status(oid, "delivered", proof=proof)
+    
+    await m.answer("✅ Скриншот отправлен на проверку. Ожидайте.")
 
-    await m.answer(
-        f"✅ Подтверждение принято.\n<b>{o['price_stars']:g} {curr.upper()}</b> зачислены на баланс.\n"
-        f"Баланс: <b>{newbal:g} {curr.upper()}</b>", reply_markup=kb_menu(m.from_user.id))
+    caption = f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})\n\nПодарок: {o['gift_name']}\nСумма: {o['price_stars']:g} {o['currency'].upper()}"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Выдать звёзды", callback_data=f"a:proof:approve:{oid}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"a:proof:reject:{oid}")]
+    ])
 
-    caption = f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})"
     try:
         if m.photo:
-            await adm_bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=caption)
+            await adm_bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=caption, reply_markup=kb)
         elif m.document:
-            await adm_bot.send_document(o["admin_id"], m.document.file_id, caption=caption)
+            await adm_bot.send_document(o["admin_id"], m.document.file_id, caption=caption, reply_markup=kb)
         elif m.text:
-            await adm_bot.send_message(o["admin_id"], caption + f"\n\n<b>Текст:</b>\n{m.text}")
+            await adm_bot.send_message(o["admin_id"], caption + f"\n\n<b>Текст:</b>\n{m.text}", reply_markup=kb)
     except Exception as e:
         log.error(f"Не удалось переслать proof: {e}")
 
@@ -480,24 +482,7 @@ async def adm_currency(cb: CallbackQuery, state: FSMContext):
     curr = cb.data.split(":")[2]
     await state.update_data(currency=curr)
     await state.set_state(AdminFlow.target)
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎲 Случайный", callback_data="a:rand_target")]
-    ])
-    await cb.message.edit_text("5/5. @username получателя подарка:", reply_markup=kb)
-    await cb.answer()
-
-@adm.callback_query(F.data == "a:rand_target")
-async def adm_rand_target(cb: CallbackQuery, state: FSMContext):
-    nick = "@" + "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(6, 10)))
-    await state.update_data(target=nick)
-    d = await state.get_data()
-    await state.set_state(AdminFlow.confirm)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Отправить", callback_data="a:confirm_yes"), InlineKeyboardButton(text="❌ Отмена", callback_data="a:confirm_no")],
-        [InlineKeyboardButton(text="🎲 Ещё ник", callback_data="a:rand_target")]
-    ])
-    await cb.message.edit_text(f"Проверка:\nПодарок: <b>{d['gift_name']}</b>\nЦена: <b>{d['price']:g} {d['currency'].upper()}</b>\nПолучатель: <b>{nick}</b>\n\nВсе верно?", reply_markup=kb)
+    await cb.message.edit_text("5/5. @username получателя подарка:")
     await cb.answer()
 
 @adm.message(AdminFlow.target)
@@ -560,7 +545,7 @@ async def cb_stats(cb: CallbackQuery):
 async def cb_cleanup(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return await cb.answer("Нет доступа", show_alert=True)
     with db() as c:
-        res = c.execute("DELETE FROM offers WHERE status IN ('paid', 'declined', 'cancelled', 'delivered')")
+        res = c.execute("DELETE FROM offers WHERE status IN ('paid', 'declined', 'cancelled')")
         await cb.message.answer(f"✅ База очищена. Удалено отработанных офферов: {res.rowcount}")
     await cb.answer()
 
@@ -604,6 +589,7 @@ async def cb_broadcast_end(m: Message, state: FSMContext):
             fail += 1
     await msg.edit_text(f"📢 Рассылка завершена.\nУспешно: {ok}\nОшибок: {fail}", reply_markup=kb_admin_panel())
 
+# --- Add balance ---
 @adm.callback_query(F.data == "a:addbal")
 async def cb_addbal_start(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
@@ -669,6 +655,7 @@ async def cb_users(cb: CallbackQuery):
     await cb.message.answer(text)
     await cb.answer()
 
+# --- Send offer directly to user ---
 @adm.callback_query(F.data == "a:send_offer")
 async def cb_send_offer(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
@@ -735,6 +722,96 @@ async def cb_send_offer_target(m: Message, state: FSMContext, shop_bot: Bot):
         disable_web_page_preview=False
     )
     await m.answer(f"✅ Оффер #{oid} отправлен юзеру {d['target_user']}.", reply_markup=kb_admin_panel())
+
+# --- Проверка proof ---
+@adm.callback_query(F.data.startswith("a:proof:approve:"))
+async def cb_proof_approve(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id): return
+    oid = int(cb.data.split(":")[3])
+    o = get_offer(oid)
+    if not o: return await cb.answer("Оффер не найден.", show_alert=True)
+    if o["status"] != "delivered": return await cb.answer("Уже обработан.", show_alert=True)
+
+    set_status(oid, "paid")
+    newbal = add_balance(o["user_id"], o["currency"], o["price_stars"])
+    try:
+        await cb.bot.send_message(o["user_id"], f"✅ Ваш оффер #{oid} подтвержден.\nНачислено: <b>{o['price_stars']:g} {o['currency'].upper()}</b>\nБаланс: <b>{newbal:g}</b>")
+    except: pass
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.answer("Начислено.")
+
+@adm.callback_query(F.data.startswith("a:proof:reject:"))
+async def cb_proof_reject(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id): return
+    oid = int(cb.data.split(":")[3])
+    o = get_offer(oid)
+    if not o: return await cb.answer("Оффер не найден.", show_alert=True)
+    
+    set_status(oid, "declined")
+    try:
+        await cb.bot.send_message(o["user_id"], f"❌ Ваш оффер #{oid} отклонен. Скриншот не подтвержден.")
+    except: pass
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.answer("Отклонено.")
+
+# --- Офферы по статусу ---
+@adm.callback_query(F.data == "a:offers_menu")
+async def cb_offers_menu(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id): return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Draft (Черновик)", callback_data="a:off:status:draft"), InlineKeyboardButton(text="Accepted (Принят)", callback_data="a:off:status:accepted")],
+        [InlineKeyboardButton(text="Delivered (Ожидает проверки)", callback_data="a:off:status:delivered"), InlineKeyboardButton(text="Paid (Оплачен)", callback_data="a:off:status:paid")],
+        [InlineKeyboardButton(text="Declined (Отклонен)", callback_data="a:off:status:declined")],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="a:back")]
+    ])
+    await cb.message.edit_text("Выберите статус:", reply_markup=kb)
+    await cb.answer()
+
+@adm.callback_query(F.data.startswith("a:off:status:"))
+async def cb_offers_by_status(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id): return
+    status = cb.data.split(":")[3]
+    with db() as c:
+        offers = c.execute("SELECT * FROM offers WHERE status=? ORDER BY id DESC LIMIT 20", (status,)).fetchall()
+    
+    if not offers:
+        return await cb.message.edit_text(f"Офферов со статусом {status} нет.", 
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Назад", callback_data="a:offers_menu")]]))
+        
+    text = f"🗂 <b>Офферы {status}:</b>\n\n"
+    for o in offers:
+        text += f"#{o['id']} | {o['gift_name']} | {o['price_stars']:g} {o['currency'].upper()} | UID: {o['user_id'] or '-'}\n"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Назад", callback_data="a:offers_menu")]])
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+@adm.callback_query(F.data == "a:back")
+async def cb_back(cb: CallbackQuery):
+    await cb.message.edit_text("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=kb_admin_panel())
+    await cb.answer()
+
+# --- Генератор ников ---
+@adm.callback_query(F.data == "a:nickgen")
+async def cb_nickgen(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id): return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Сгенерировать ещё", callback_data="a:nickgen_more")],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="a:back")]
+    ])
+    nick = "@" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    await cb.message.edit_text(f"🎲 Ваш ник: <code>{nick}</code>\n\nНажмите кнопку, чтобы получить ещё.", reply_markup=kb)
+    await cb.answer()
+
+@adm.callback_query(F.data == "a:nickgen_more")
+async def cb_nickgen_more(cb: CallbackQuery):
+    nick = "@" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Сгенерировать ещё", callback_data="a:nickgen_more")],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="a:back")]
+    ])
+    await cb.message.edit_text(f"🎲 Ваш ник: <code>{nick}</code>\n\nНажмите кнопку, чтобы получить ещё.", reply_markup=kb)
+    await cb.answer()
 
 # ================= WEB =================
 async def handle_ping(request):
