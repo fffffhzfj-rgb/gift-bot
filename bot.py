@@ -369,8 +369,12 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
         text = offer_text(o)
         kb = offer_kb(oid)
         
-        # Отправляем текст, ОТКЛЮЧАЕМ скрытие превью (чтобы ссылка развернулась как на фото 2)
-        await m.answer(text, reply_markup=kb, disable_web_page_preview=False)
+        # ШАГ 1: Отправляем текст, чтобы Telegram развернул ссылку в картинку. 
+        # Ставим disable_web_page_preview=False
+        msg = await m.answer(text, disable_web_page_preview=False)
+        
+        # ШАГ 2: Прикрепляем кнопки к отправленному сообщению
+        await msg.edit_reply_markup(reply_markup=kb)
         return
 
     with db() as c:
