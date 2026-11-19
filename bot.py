@@ -317,7 +317,8 @@ async def receive_proof(m: Message, state: FSMContext, adm_bot: Bot):
         await adm_bot.send_message(o["admin_id"], f"📥 <b>Оффер #{oid}</b>: proof от <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a> (@{m.from_user.username or '—'})")
         if m.photo: await adm_bot.send_photo(o["admin_id"], m.photo[-1].file_id, caption=f"Скриншот к офферу #{oid}")
     except Exception as e: log.error(f"Не удалось переслать скрин: {e}")
-    @shop.callback_query(F.data == "m:balance")
+
+@shop.callback_query(F.data == "m:balance")
 async def shop_balance(cb: CallbackQuery):
     bal_s = get_balance(cb.from_user.id, 'stars')
     bal_g = get_balance(cb.from_user.id, 'gram')
@@ -396,7 +397,6 @@ async def shop_support(m: Message):
 async def shop_autoreg(m: Message):
     upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name)
 
-# ================= ADMIN BOT =================
 adm = Router()
 
 @adm.message(Command("start"))
@@ -603,7 +603,6 @@ async def cb_users(cb: CallbackQuery):
     await cb.message.answer(text)
     await cb.answer()
 
-# ================= WEB SERVER & PINGER =================
 async def handle_ping(request):
     return web.Response(text="OK")
 
