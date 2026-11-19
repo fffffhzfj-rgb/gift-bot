@@ -358,6 +358,8 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
         if not o: return await m.answer("Оффер не найден.")
         if o["status"] != "draft" and o["user_id"] != m.from_user.id:
             return await m.answer("Этот оффер уже использован.")
+        
+        # Если оффер новый (draft), занимаем его
         if o["status"] == "draft":
             if not claim_offer(oid, m.from_user.id):
                 return await m.answer("Оффер уже занят.")
@@ -367,18 +369,30 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
                     f"🔔 Оффер #{oid} открыт: <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a>")
             except Exception: pass
         
-        text = offer_text(o)
+        # ФОРМИРУЕМ ТЕКСТ С СЫЛКОЙ (чтобы Telegram сделал WebApp)
+        reward = reward_label(o["reward_type"] or "stars", o["reward_value"] or 0)
+        expires_at = datetime.fromisoformat(o["expires_at"]); now_dt = datetime.now(timezone.utc)
+        delta = expires_at - now_dt
+        hours, rem = divmod(delta.seconds, 3600) if delta.seconds > 0 else (0,0)
+        time_left = f"{hours} ч. {rem // 60} м."
+        
+        text = (
+            f"Пользователь предлагает Вам {reward} за {o['gift_name']}\n\n"
+            f"Предложение действует ещё {time_left}\n\n"
+            f"🔗 <a href='{o['nft_link']}'>Посмотреть NFT</a>"
+        )
+        
         kb = offer_kb(oid)
         
-        # 1. Отправляем текст с развернутой ссылкой (Telegram нарисует WebApp-карточку)
+        # 1. Отправляем ОДНО сообщение с WebApp-ссылкой
         msg = await m.answer(text, disable_web_page_preview=False, parse_mode="HTML")
         
-        # 2. Ждем полсекунды, чтобы Telegram успел отрисовать карточку, и прикрепляем кнопки
-        await asyncio.sleep(0.5)
+        # 2. Прикрепляем кнопки к этому же сообщению (с задержкой, чтобы Telegram отрисовал)
+        await asyncio.sleep(0.8)
         try:
             await msg.edit_reply_markup(reply_markup=kb)
         except Exception as e:
-            log.error(f"Не удалось прикрепить кнопки: {e}")
+            log.error(f"Telegram отказался прикреплять кнопки к WebApp: {e}")
             
         return
 
@@ -387,7 +401,6 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
                                 (m.from_user.id,)).fetchone()
     await m.answer("👋 Добро пожаловать! Получайте Stars / GRAM / Premium.",
                    reply_markup=main_menu_kb(m.from_user.id, has_pending))
-
 @shop.callback_query(F.data.startswith("o:accept:"))
 async def cb_offer_accept(cb: CallbackQuery):
     oid = int(cb.data.split(":")[2]); o = get_offer(oid)
