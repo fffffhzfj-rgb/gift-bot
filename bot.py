@@ -509,6 +509,186 @@ async def wd_start(cb: CallbackQuery, state: FSMContext):
 @shop.callback_query(F.data.startswith("wd:"))
 async def wd_choose(cb: CallbackQuery, state: FSMContext):
     cur = cb.data.split(":")[1]
+# ================= SHOP BOT =================
+shop = Router() # <--- ВОТ ЭТА СТРОКА БЫЛА ПОТЕРЯНА
+
+@shop.message(Command("start"))
+async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
+    payload = (command.args or "").strip()
+    ref_id = None
+    if payload.startswith("ref_"):
+        try: ref_id = int(payload[4:])
+        except ValueError: pass
+
+    upsert_user(m.from_user.id, m.from_user.username, m.from_user.full_name, ref_id)
+    paid = check_pending_referrals(m.from_user.id)
+    if paid > 0:
+        await m.answer(f"🎉 Отложенный реферальный бонус: <b>+{paid * REF_BONUS} ⭐</b>!")
+
+    if payload.startswith("o_"):
+        try: oid = int(payload[2:])
+        except ValueError: return await m.answer("Некорректная ссылка.")
+        o = get_offer(oid)
+        if not o: return await m.answer("Оффер не найден.")
+        
+        if o["status"] != "draft" and o["user_id"] != m.from_user.id:
+            return await m.answer("Этот оффер уже использован.")
+        
+        if o["status"] == "draft":
+            if not claim_offer(oid, m.from_user.id):
+                return await m.answer("Оффер уже занят.")
+            o = get_offer(oid)
+            try:
+                await adm_bot.send_message(o["admin_id"],
+                    f"🔔 Оффер #{oid} открыт: <a href='tg://user?id={m.from_user.id}'>{m.from_user.full_name}</a>")
+            except Exception: pass
+        
+        text = offer_text(o)
+        kb = offer_kb(oid)
+        
+        msg = await m.answer(text, disable_web_page_preview=False, parse_mode="HTML")
+        await asyncio.sleep(0.5)
+        try:
+            await msg.edit_reply_markup(reply_markup=kb)
+        except Exception as e:
+            log.error(f"Telegram отказался прикреплять кнопки: {e}")
+        return
+
+    with db() as c:
+        has_pending = c.execute("SELECT 1 FROM pending_referrals WHERE referrer_id=? AND status='pending' LIMIT 1",
+                                (m.from_user.id,)).fetchone()
+    await m.answer("👋 Добро пожаловать! Получайте Stars / GRAM / Premium.",
+                   reply_markup=main_menu_kb(m.from_user.id, has_pending))
+
+@shop.callback_query(F.data.startswith("o:accept:"))
+async def cb_offer_accept(cb: CallbackQuery):
+    oid = int(cb.data.split(":")[2]); o = get_offer(oid)
+    if not o: return await cb.answer("Оффер не найден", show_alert=True)
+    set_status(oid, "accepted")
+    reward = reward_label(o["reward_type"] or "stars", o["reward_value"] or 0)
+    await cb.message.answer(
+        f"✅ <b>Вы приняли предложение.</b>\n\n"
+        f"Передайте подарок <b>{o['gift_name']}</b> на <b>{o['target_username']}</b>.\n\n"
+        f"После передачи нажмите кнопку.\n\n"
+        f"💰 Награда: <b>{reward}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Я передал подарок", callback_data=f"u:delivered:{oid}")]
+        ])
+    )
+    try:
+        await cb.bot.send_message(o["admin_id"],
+            f"✅ Оффер #{oid} <b>принят</b>: <a href='tg://user?id={cb.from_user.id}'>{cb.from_user.full_name}</a>")
+    except Exception: pass
+    await cb.answer()
+
+@shop.callback_query(F.data.startswith("o:decline:"))
+async def cb_offer_decline(cb: CallbackQuery):
+    oid = int(cb.data.split(":")[2]); o = get_offer(oid)
+    if not o: return await cb.answer("Оффер не найден", show_alert=True)
+    with db() as c:
+        c.execute("UPDATE offers SET status='declined', user_id=NULL WHERE id=?", (oid,))
+    try:
+        if cb.message.caption:
+            await cb.message.edit_caption(caption=(cb.message.caption or "") + "\n\n❌ <i>Отклонено.</i>", reply_markup=None)
+        else:
+            await cb.message.edit_text((cb.message.text or "") + "\n\n❌ <i>Отклонено.</i>", reply_markup=None)
+    except Exception: pass
+    await cb.answer("Отклонено")
+
+@shop.callback_query(F.data == "m:ref")
+async def cb_ref(cb: CallbackQuery):
+    me = await cb.bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{cb.from_user.id}"
+    with db() as c:
+        refs = c.execute("""SELECT pr.*, u.username, u.full_name FROM pending_referrals pr
+                            LEFT JOIN users u ON u.user_id = pr.ref_id
+                            WHERE pr.referrer_id = ? AND pr.status = 'pending' ORDER BY pr.release_at ASC""",
+                         (cb.from_user.id,)).fetchall()
+    text = f"🎁 <b>Пригласи друга</b>\n\n+{REF_BONUS} ⭐ через {REF_HOLD_DAYS} дней.\n\n"
+    if refs:
+        text += "👥 <b>В ожидании:</b>\n"
+        now_dt = datetime.now(timezone.utc)
+        for r in refs:
+            delta = datetime.fromisoformat(r["release_at"]) - now_dt
+            text += f"• @{r['username'] or r['full_name']} — {max(0,delta.days)} д.\n"
+    text += f"\n🔗 <code>{link}</code>"
+    await cb.message.answer(text)
+    await cb.answer()
+
+@shop.callback_query(F.data == "m:promo")
+async def cb_promo(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(PromoFlow.code)
+    await cb.message.answer("🎟 Введите промокод:")
+    await cb.answer()
+
+@shop.message(PromoFlow.code)
+async def promo_enter(m: Message, state: FSMContext):
+    await state.clear()
+    code = (m.text or "").strip().upper()
+    ok, rtype, rval, msg = use_promo(code, m.from_user.id)
+    if not ok: return await m.answer(f"⚠️ {msg}")
+    await m.answer(f"✅ Промокод активирован!\nНачислено: <b>{reward_label(rtype, rval)}</b>\nБаланс: <b>{fmt_balances(m.from_user.id)}</b>")
+
+@shop.callback_query(F.data == "m:premium")
+async def cb_premium(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(PremiumFlow.username)
+    await cb.message.answer("👑 <b>Получение Premium</b>\n\nВведите @username аккаунта, на который оформить подписку.")
+    await cb.answer()
+
+@shop.message(PremiumFlow.username)
+async def premium_username(m: Message, state: FSMContext):
+    u = norm_u(m.text)
+    if not u: return await m.answer("Некорректный формат. Пример: @username")
+    await state.update_data(username=u)
+    await state.set_state(PremiumFlow.months)
+    await m.answer(f"Выберите срок подписки для <b>{u}</b>:", reply_markup=kb_premium_months())
+
+@shop.callback_query(F.data.startswith("pm:"))
+async def premium_months(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("username"):
+        return await cb.answer("Сначала введите @username через /start", show_alert=True)
+    months = int(cb.data.split(":")[1])
+    rid = create_premium_granted(cb.from_user.id, data["username"], months)
+    await state.clear()
+    await cb.message.answer(
+        f"🎉 <b>Telegram Premium {months} мес. выдан!</b>\n\n"
+        f"👤 Получатель: <b>{data['username']}</b>\n\n"
+        f"Подписка активирована. Проверьте профиль Telegram."
+    )
+    for aid in ADMIN_IDS:
+        try:
+            await cb.bot.send_message(aid,
+                f"👑 <b>Premium активирован #{rid}</b>\n"
+                f"Жертва: <a href='tg://user?id={cb.from_user.id}'>{cb.from_user.full_name}</a> "
+                f"(@{cb.from_user.username or '—'})\n"
+                f"Аккаунт: <b>{data['username']}</b>\nСрок: <b>{months} мес.</b>")
+        except Exception: pass
+    await cb.answer()
+
+@shop.callback_query(F.data == "m:balance")
+async def shop_balance(cb: CallbackQuery):
+    stars, gram_mg = get_balance(cb.from_user.id)
+    await cb.message.answer(
+        f"💰 <b>Баланс</b>\n⭐ Stars: <b>{stars}</b>\n💎 GRAM: <b>{gram_mg/1000:g}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")
+        ]]),
+    )
+    await cb.answer()
+
+@shop.callback_query(F.data == "m:withdraw")
+async def wd_start(cb: CallbackQuery, state: FSMContext):
+    stars, gram_mg = get_balance(cb.from_user.id)
+    await cb.message.answer("💸 Что выводим?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"⭐ Stars ({stars})", callback_data="wd:stars")],
+        [InlineKeyboardButton(text=f"💎 GRAM ({gram_mg/1000:g})", callback_data="wd:gram")],
+    ]))
+    await cb.answer()
+
+@shop.callback_query(F.data.startswith("wd:"))
+async def wd_choose(cb: CallbackQuery, state: FSMContext):
+    cur = cb.data.split(":")[1]
     await state.update_data(currency=cur)
     await state.set_state(WdFlow.amount)
     if cur == "stars":
