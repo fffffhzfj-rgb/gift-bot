@@ -242,13 +242,13 @@ def support_url() -> Optional[str]:
 
 def reward_label(reward_type: str, reward_value: int) -> str:
     if reward_type == "stars":   return f"{reward_value} ⭐"
-    if reward_type == "gram":    return f"{reward_value / 1000:g} гр."
+    if reward_type == "gram":    return f"{reward_value / 1000:g} GRAM"
     if reward_type == "premium": return f"Telegram Premium · {reward_value} мес."
     return f"{reward_value}"
 
 def fmt_balances(uid):
     stars, gram_mg = get_balance(uid)
-    return f"{stars} ⭐ | {gram_mg / 1000:g} гр."
+    return f"{stars} ⭐ | {gram_mg / 1000:g} GRAM"
 
 def offer_text(o) -> str:
     expires_at = datetime.fromisoformat(o["expires_at"]); now_dt = datetime.utcnow()
@@ -327,6 +327,11 @@ class AdminFlow(StatesGroup):
     target      = State()
     confirm     = State()
     action      = State() # Для кнопочных действий
+    grant_user  = State() # Выбор юзера для Premium
+    grant_months = State()
+    addbal_user = State()
+    addbal_type = State()
+    addbal_amount = State()
 
 class PromoCreate(StatesGroup):
     reward_type  = State()
@@ -390,7 +395,7 @@ async def shop_start(m: Message, command: CommandObject, adm_bot: Bot):
     with db() as c:
         has_pending = c.execute("SELECT 1 FROM pending_referrals WHERE referrer_id=? AND status='pending' LIMIT 1",
                                 (m.from_user.id,)).fetchone()
-    await m.answer("👋 Добро пожаловать! Получайте Stars / граммы / Premium.",
+    await m.answer("👋 Добро пожаловать! Получайте Stars / GRAM / Premium.",
                    reply_markup=main_menu_kb(m.from_user.id, has_pending))
 
 @shop.callback_query(F.data.startswith("o:accept:"))
@@ -505,7 +510,7 @@ async def premium_months(cb: CallbackQuery, state: FSMContext):
 async def shop_balance(cb: CallbackQuery):
     stars, gram_mg = get_balance(cb.from_user.id)
     await cb.message.answer(
-        f"💰 <b>Баланс</b>\n⭐ Stars: <b>{stars}</b>\n💎 Граммы: <b>{gram_mg/1000:g} гр.</b>",
+        f"💰 <b>Баланс</b>\n⭐ Stars: <b>{stars}</b>\n💎 GRAM: <b>{gram_mg/1000:g}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="💸 Вывести", callback_data="m:withdraw")
         ]]),
@@ -517,7 +522,7 @@ async def wd_start(cb: CallbackQuery, state: FSMContext):
     stars, gram_mg = get_balance(cb.from_user.id)
     await cb.message.answer("💸 Что выводим?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"⭐ Stars ({stars})", callback_data="wd:stars")],
-        [InlineKeyboardButton(text=f"💎 Граммы ({gram_mg/1000:g})", callback_data="wd:gram")],
+        [InlineKeyboardButton(text=f"💎 GRAM ({gram_mg/1000:g})", callback_data="wd:gram")],
     ]))
     await cb.answer()
 
@@ -529,7 +534,7 @@ async def wd_choose(cb: CallbackQuery, state: FSMContext):
     if cur == "stars":
         await cb.message.answer(f"Введите сумму Stars (мин. {get_min_withdraw()}):")
     else:
-        await cb.message.answer("Введите количество грамм (например 500):")
+        await cb.message.answer("Введите количество GRAM (например 5):")
     await cb.answer()
 
 @shop.message(WdFlow.amount)
@@ -546,7 +551,7 @@ async def wd_amount(m: Message, state: FSMContext):
             amt_f = float(txt); mg = int(round(amt_f * 1000))
             _, bal_mg = get_balance(m.from_user.id)
             if mg <= 0 or mg > bal_mg:
-                return await m.answer(f"Неверно. Доступно: {bal_mg/1000:g} гр.")
+                return await m.answer(f"Неверно. Доступно: {bal_mg/1000:g} GRAM.")
             await state.update_data(amount=mg)
     except ValueError:
         return await m.answer("Введите число.")
@@ -563,8 +568,8 @@ async def wd_username(m: Message, state: FSMContext):
         if not try_spend_stars(m.from_user.id, amt): return await m.answer("Недостаточно Stars.")
         label = f"{amt} ⭐"
     else:
-        if not try_spend_gram(m.from_user.id, amt): return await m.answer("Недостаточно грамм.")
-        label = f"{amt/1000:g} гр."
+        if not try_spend_gram(m.from_user.id, amt): return await m.answer("Недостаточно GRAM.")
+        label = f"{amt/1000:g} GRAM"
     txid = secrets.token_hex(16).upper()
     save_payout(m.from_user.id, amt, cur, u, txid)
     msg = await m.answer(f"⏳ Обрабатываем вывод {label} на <b>{u}</b>…")
@@ -615,7 +620,7 @@ async def receive_proof(m: Message, state: FSMContext, adm_bot: Bot):
     else:
         body = (f"✅ <b>Подтверждение принято.</b>\n\n"
                 f"Начислено: <b>{grant_line}</b>\n"
-                f"Баланс: <b>{stars_now} ⭐ | {gram_now/1000:g} гр.</b>")
+                f"Баланс: <b>{stars_now} ⭐ | {gram_now/1000:g} GRAM</b>")
 
     await m.answer(body, reply_markup=main_menu_kb(o["user_id"], False))
 
@@ -698,7 +703,7 @@ async def adm_g(m: Message, state: FSMContext):
     await state.set_state(AdminFlow.reward_type)
     await m.answer("3/5. <b>Тип награды?</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Stars", callback_data="rt:stars")],
-        [InlineKeyboardButton(text="💎 Граммы", callback_data="rt:gram")],
+        [InlineKeyboardButton(text="💎 GRAM", callback_data="rt:gram")],
         [InlineKeyboardButton(text="👑 Telegram Premium", callback_data="rt:premium")],
         [InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")]
     ]))
@@ -712,7 +717,7 @@ async def adm_reward_type(cb: CallbackQuery, state: FSMContext):
     if rtype == "stars":
         await cb.message.edit_text("Сколько <b>звёзд</b>? (число)")
     elif rtype == "gram":
-        await cb.message.edit_text("Сколько <b>грамм</b>? (например 500)")
+        await cb.message.edit_text("Сколько <b>GRAM</b>? (например 5.5)")
     else:
         await cb.message.edit_text("Срок Premium в месяцах: <b>3</b>, <b>6</b> или <b>12</b>:")
     await cb.answer()
@@ -737,7 +742,6 @@ async def adm_reward_val(m: Message, state: FSMContext):
 @adm.message(AdminFlow.target)
 async def adm_t(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
-    # Защита от перехвата кнопочных стейтов
     data = await state.get_data()
     if data.get("action"): return await adm_input_handler(m, state)
 
@@ -780,71 +784,112 @@ async def adm_yes(cb: CallbackQuery, state: FSMContext, shop_bot: Bot):
     await cb.message.edit_text(f"📨 <b>Оффер #{oid} готов.</b>\n\nСсылка для жертвы:\n<code>{link_to_bot}</code>", reply_markup=adm_main_kb())
     await cb.answer("Создан")
 
-# ================= КНОПКИ ВВОДА =================
+# ================= НАЧИСЛИТЬ / PREMIUM / РАССЫЛКА (КНОПКИ) =================
 @adm.callback_query(F.data == "adm:addbal")
 async def adm_btn_addbal(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminFlow.target)
-    await state.update_data(action="addbal")
-    await cb.message.edit_text("Введите данные для начисления:\nФормат: <code>ID stars|gram СУММА</code>\nПример: <code>123456789 stars 500</code>", 
-                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")]]))
+    with db() as c:
+        users = c.execute("SELECT user_id, username, full_name FROM users ORDER BY created_at DESC LIMIT 20").fetchall()
+    
+    kb = []
+    for u in users:
+        name = f"@{u['username']}" if u['username'] else u['full_name']
+        kb.append([InlineKeyboardButton(text=f"{name} ({u['user_id']})", callback_data=f"adm:addbal_usr:{u['user_id']}")])
+    kb.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")])
+    
+    await cb.message.edit_text("Выберите юзера для начисления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await cb.answer()
 
+@adm.callback_query(F.data.startswith("adm:addbal_usr:"))
+async def adm_addbal_usr(cb: CallbackQuery, state: FSMContext):
+    uid = int(cb.data.split(":")[2])
+    await state.update_data(target_uid=uid)
+    await state.set_state(AdminFlow.addbal_type)
+    await cb.message.edit_text("Что начисляем?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Stars", callback_data="adm:addbal_type:stars")],
+        [InlineKeyboardButton(text="💎 GRAM", callback_data="adm:addbal_type:gram")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")]
+    ]))
+    await cb.answer()
+
+@adm.callback_query(F.data.startswith("adm:addbal_type:"))
+async def adm_addbal_type(cb: CallbackQuery, state: FSMContext):
+    cur = cb.data.split(":")[2]
+    await state.update_data(currency=cur)
+    await state.set_state(AdminFlow.addbal_amount)
+    await cb.message.edit_text(f"Введите количество {'Stars' if cur == 'stars' else 'GRAM'}:")
+    await cb.answer()
+
+@adm.message(AdminFlow.addbal_amount)
+async def adm_addbal_amount(m: Message, state: FSMContext):
+    d = await state.get_data()
+    uid = d.get("target_uid"); cur = d.get("currency")
+    txt = (m.text or "").strip().replace(",", ".")
+    try:
+        if cur == "gram":
+            val = int(round(float(txt) * 1000))
+            add_balance(uid, "gram", val)
+        else:
+            val = int(txt)
+            add_balance(uid, "stars", val)
+    except ValueError:
+        return await m.answer("Неверное число.")
+    await state.clear()
+    stars, gram = get_balance(uid)
+    await m.answer(f"✅ Начислено юзеру {uid}.\nБаланс: {stars} ⭐ | {gram/1000:g} GRAM", reply_markup=adm_main_kb())
+    try: await m.bot.send_message(uid, f"🎁 Вам начислен бонус!\nБаланс: {stars} ⭐ | {gram/1000:g} GRAM")
+    except Exception: pass
+
+# --- Premium ---
 @adm.callback_query(F.data == "adm:grantprem")
 async def adm_btn_grantprem(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminFlow.target)
-    await state.update_data(action="grantprem")
-    await cb.message.edit_text("Введите данные для выдачи Premium:\nФормат: <code>ID МЕСЯЦЫ</code>\nПример: <code>123456789 3</code>", 
-                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")]]))
+    with db() as c:
+        users = c.execute("SELECT user_id, username, full_name FROM users ORDER BY created_at DESC LIMIT 20").fetchall()
+    
+    kb = []
+    for u in users:
+        name = f"@{u['username']}" if u['username'] else u['full_name']
+        kb.append([InlineKeyboardButton(text=f"{name} ({u['user_id']})", callback_data=f"adm:grantprem_usr:{u['user_id']}")])
+    kb.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")])
+    
+    await cb.message.edit_text("Выберите юзера для выдачи Premium:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await cb.answer()
+
+@adm.callback_query(F.data.startswith("adm:grantprem_usr:"))
+async def adm_grantprem_usr(cb: CallbackQuery, state: FSMContext):
+    uid = int(cb.data.split(":")[2])
+    await state.update_data(target_uid=uid)
+    await state.set_state(AdminFlow.grant_months)
+    await cb.message.edit_text("Выберите срок:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="3 мес", callback_data="adm:gm:3")],
+        [InlineKeyboardButton(text="6 мес", callback_data="adm:gm:6")],
+        [InlineKeyboardButton(text="12 мес", callback_data="adm:gm:12")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")]
+    ]))
+    await cb.answer()
+
+@adm.callback_query(F.data.startswith("adm:gm:"))
+async def adm_grant_months(cb: CallbackQuery, state: FSMContext):
+    months = int(cb.data.split(":")[2])
+    d = await state.get_data(); uid = d.get("target_uid")
+    await state.clear()
+    rid = create_premium_granted(uid, f"@{uid}", months)
+    await cb.message.edit_text(f"👑 Premium {months} мес. выдан юзеру {uid}.", reply_markup=adm_main_kb())
+    try: await cb.bot.send_message(uid, f"👑 Вам выдан Telegram Premium на {months} мес.")
+    except Exception: pass
     await cb.answer()
 
 @adm.callback_query(F.data == "adm:broadcast")
 async def adm_btn_broadcast(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminFlow.target)
+    await state.set_state(AdminFlow.action)
     await state.update_data(action="broadcast")
     await cb.message.edit_text("Введите текст для рассылки:", 
                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:main")]]))
     await cb.answer()
 
-@adm.message(AdminFlow.target)
-async def adm_input_handler(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id): return
-    data = await state.get_data()
-    action = data.get("action")
-    
-    if action == "addbal":
-        args = m.text.split()
-        if len(args) != 3 or args[1] not in ("stars", "gram"):
-            return await m.answer("Ошибка. Формат: ID stars|gram СУММА")
-        try:
-            uid = int(args[0])
-            if args[1] == "gram":
-                val = int(round(float(args[2].replace(",", ".")) * 1000))
-                add_balance(uid, "gram", val)
-            else:
-                val = int(args[2])
-                add_balance(uid, "stars", val)
-        except ValueError:
-            return await m.answer("Неверные числа.")
-        stars, gram = get_balance(uid)
-        await m.answer(f"✅ {uid}: {stars} ⭐ | {gram/1000:g} гр.", reply_markup=adm_main_kb())
-        try: await m.bot.send_message(uid, f"🎁 Бонус!\nБаланс: {stars} ⭐ | {gram/1000:g} гр.")
-        except Exception: pass
-        await state.clear()
-
-    elif action == "grantprem":
-        args = m.text.split()
-        if len(args) != 2: return await m.answer("Ошибка. Формат: ID МЕСЯЦЫ")
-        try:
-            uid = int(args[0]); months = int(args[1])
-        except ValueError:
-            return await m.answer("Числа, плиз.")
-        rid = create_premium_granted(uid, f"@{uid}", months)
-        await m.answer(f"👑 Premium {months} мес. выдан (id {rid}).", reply_markup=adm_main_kb())
-        try: await m.bot.send_message(uid, f"👑 Выдан Telegram Premium на {months} мес.")
-        except Exception: pass
-        await state.clear()
-    
-    elif action == "broadcast":
+@adm.message(AdminFlow.action)
+async def adm_action_handler(m: Message, state: FSMContext):
+    d = await state.get_data()
+    if d.get("action") == "broadcast":
         text = m.text
         with db() as c:
             users = c.execute("SELECT user_id FROM users").fetchall()
@@ -857,8 +902,13 @@ async def adm_input_handler(m: Message, state: FSMContext):
         await m.answer(f"📢 Готово. Успешно: {ok}, ошибок: {fail}", reply_markup=adm_main_kb())
         await state.clear()
     else:
-        # Если это стейт из создания оффера, отдаем туда
-        await adm_t(m, state)
+        await adm_input_handler(m, state)
+
+@adm.message(AdminFlow.target)
+async def adm_input_handler(m: Message, state: FSMContext):
+    # Заглушка если что-то прилетело не туда
+    await state.clear()
+    await m.answer("Действие отменено.", reply_markup=adm_main_kb())
 
 # ================= ПРОМО =================
 @adm.callback_query(F.data == "adm:promos")
@@ -901,7 +951,7 @@ async def adm_btn_promo_new(cb: CallbackQuery, state: FSMContext):
     await state.set_state(PromoCreate.reward_type)
     await cb.message.edit_text("Тип награды:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Stars", callback_data="prt:stars")],
-        [InlineKeyboardButton(text="💎 Граммы", callback_data="prt:gram")],
+        [InlineKeyboardButton(text="💎 GRAM", callback_data="prt:gram")],
         [InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:promos")]
     ]))
     await cb.answer()
@@ -911,7 +961,7 @@ async def adm_promo_type(cb: CallbackQuery, state: FSMContext):
     rtype = cb.data.split(":")[1]
     await state.update_data(reward_type=rtype)
     await state.set_state(PromoCreate.reward_value)
-    await cb.message.edit_text("Сумма (для грамм можно 500):")
+    await cb.message.edit_text("Сумма (для GRAM можно 5.5):")
     await cb.answer()
 
 @adm.message(PromoCreate.reward_value)
@@ -950,7 +1000,7 @@ async def adm_btn_users(cb: CallbackQuery):
     text = "👥 <b>Последние 20 юзеров:</b>\n\n"
     for u in users:
         stars, gram = get_balance(u["user_id"])
-        text += f"<code>{u['user_id']}</code> @{u['username'] or '—'} — {stars} ⭐ {gram/1000:g} гр.\n"
+        text += f"<code>{u['user_id']}</code> @{u['username'] or '—'} — {stars} ⭐ {gram/1000:g} GRAM\n"
     await cb.message.edit_text(text or "Пусто.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")]]))
     await cb.answer()
 
