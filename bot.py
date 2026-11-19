@@ -24,6 +24,7 @@ PAYOUT_DELAY_SEC = 7
 OFFER_TTL_HOURS = 6
 REF_BONUS = 500
 REF_HOLD_DAYS = 7
+USERS_PER_PAGE = 8
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dual")
@@ -152,9 +153,8 @@ def save_payout(uid, amount, currency, username, txid):
 class AdminFlow(StatesGroup):
     nft_link = State(); gift_name = State(); price = State(); currency = State(); target = State(); confirm = State()
     broadcast = State(); setmin = State()
-    addbal_search = State(); addbal_amount = State(); addbal_currency = State()
+    addbal_manual = State(); addbal_amount = State(); addbal_currency = State()
     send_offer_user = State(); send_offer_link = State(); send_offer_name = State(); send_offer_price = State(); send_offer_curr = State(); send_offer_target = State()
-    reject_reason = State()
 
 class UserFlow(StatesGroup):
     proof = State()
@@ -185,7 +185,6 @@ def offer_text(o):
         time_left = f"{hours} ч. {rem // 60} м."
 
     price_str = fmt_price(o['price_stars'], o['currency'])
-
     return (
         f"Пользователь предлагает Вам {price_str} за {o['gift_name']}\n\n"
         f"Предложение действует ещё {time_left}"
@@ -362,9 +361,8 @@ async def receive_proof(m: Message, state: FSMContext, adm_bot: Bot):
             await adm_bot.send_message(o["admin_id"], caption + f"\n\n<b>Текст:</b>\n{m.text}", reply_markup=kb)
     except Exception as e:
         log.error(f"Не удалось переслать proof: {e}")
-        # fallback — шлём текст, если медиа не прошло
         try:
-            await adm_bot.send_message(o["admin_id"], caption + f"\n\n(Не удалось переслать файл)", reply_markup=kb)
+            await adm_bot.send_message(o["admin_id"], caption + f"\n\n(Не удалось переслать файл, но заявка есть)", reply_markup=kb)
         except Exception as e2:
             log.error(f"Fallback failed: {e2}")
 
@@ -600,16 +598,50 @@ async def cb_broadcast_end(m: Message, state: FSMContext):
             fail += 1
     await msg.edit_text(f"📢 Рассылка завершена.\nУспешно: {ok}\nОшибок: {fail}", reply_markup=kb_admin_panel())
 
-# --- Add balance ---
+# --- Add balance (Список юзеров) ---
 @adm.callback_query(F.data == "a:addbal")
 async def cb_addbal_start(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
-    await cb.message.answer("Введите <b>ID</b> или <b>@username</b> пользователя для начисления:")
-    await state.set_state(AdminFlow.addbal_search)
+    await show_users_page(cb, 0)
+
+async def show_users_page(cb: CallbackQuery, page: int):
+    with db() as c:
+        total = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        users = c.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?", (USERS_PER_PAGE, page * USERS_PER_PAGE)).fetchall()
+    
+    kb = []
+    for u in users:
+        name = u['username'] if u['username'] else u['full_name']
+        kb.append([InlineKeyboardButton(text=f"{name} ({u['user_id']})", callback_data=f"a:ab_sel:{u['user_id']}")])
+    
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"a:ab_page:{page-1}"))
+    if (page + 1) * USERS_PER_PAGE < total: nav.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"a:ab_page:{page+1}"))
+    if nav: kb.append(nav)
+    
+    kb.append([InlineKeyboardButton(text="✍️ Ввести ID вручную", callback_data="a:ab_manual")])
+    kb.append([InlineKeyboardButton(text="↩️ Назад в меню", callback_data="a:back")])
+    
+    text = f"Выберите пользователя для начисления (стр. {page+1}):"
+    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await cb.answer()
 
-@adm.message(AdminFlow.addbal_search)
-async def cb_addbal_search(m: Message, state: FSMContext):
+@adm.callback_query(F.data.startswith("a:ab_page:"))
+async def cb_addbal_page(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id): return
+    page = int(cb.data.split(":")[2])
+    await show_users_page(cb, page)
+
+@adm.callback_query(F.data == "a:ab_manual")
+async def cb_addbal_manual(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id): return
+    await state.set_state(AdminFlow.addbal_manual)
+    await cb.message.edit_text("Введите <b>ID</b> или <b>@username</b> пользователя:")
+    await cb.answer()
+
+@adm.message(AdminFlow.addbal_manual)
+async def cb_addbal_manual_input(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
     query = m.text.strip()
     uid = None
     if query.startswith('@'):
@@ -618,17 +650,26 @@ async def cb_addbal_search(m: Message, state: FSMContext):
             if r: uid = r['user_id']
     elif query.isdigit():
         uid = int(query)
-
+    
     if not uid:
-        return await m.answer("Пользователь не найден. Попробуйте снова.")
-        
+        return await m.answer("Пользователь не найден. Введите ID или @username еще раз.")
+    
+    await proceed_to_currency(m, state, uid)
+
+@adm.callback_query(F.data.startswith("a:ab_sel:"))
+async def cb_addbal_select(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id): return
+    uid = int(cb.data.split(":")[2])
+    await proceed_to_currency(cb.message, state, uid)
+
+async def proceed_to_currency(m: Message, state: FSMContext, uid: int):
     await state.update_data(uid=uid)
     await state.set_state(AdminFlow.addbal_currency)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Stars", callback_data="a:addcurr:stars"), InlineKeyboardButton(text="💎 GRAM", callback_data="a:addcurr:gram")],
         [InlineKeyboardButton(text="🌟 Premium", callback_data="a:addcurr:premium")]
     ])
-    await m.answer("Выберите валюту:", reply_markup=kb)
+    await m.answer(f"Выберите валюту для начисления пользователю <code>{uid}</code>:", reply_markup=kb)
 
 @adm.callback_query(AdminFlow.addbal_currency, F.data.startswith("a:addcurr:"))
 async def cb_addbal_currency(cb: CallbackQuery, state: FSMContext):
@@ -639,7 +680,8 @@ async def cb_addbal_currency(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 @adm.message(AdminFlow.addbal_amount)
-async def cb_addbal_amount(m: Message, state: FSMContext):
+async def cb_addbal_amount(m: Message, state: FSMContext, shop_bot: Bot):
+    if not is_admin(m.from_user.id): return
     if not m.text.replace('.', '', 1).isdigit(): return await m.answer("Введите число.")
     d = await state.get_data(); await state.clear()
     amt = float(m.text) if d['currency'] in ['gram', 'stars'] else int(m.text)
@@ -648,7 +690,7 @@ async def cb_addbal_amount(m: Message, state: FSMContext):
     await m.answer(f"✅ Пользователю {d['uid']} начислено {fmt_price(amt, d['currency'])}.\nБаланс: {newbal:g}", reply_markup=kb_admin_panel())
 
     try:
-        await m.bot.send_message(d['uid'], f"🎁 Вам начислен бонус: <b>{fmt_price(amt, d['currency'])}</b>\nВаш баланс: <b>{newbal:g}</b>")
+        await shop_bot.send_message(d['uid'], f"🎁 Вам начислен бонус: <b>{fmt_price(amt, d['currency'])}</b>\nВаш баланс: <b>{newbal:g}</b>")
     except: pass
 
 @adm.callback_query(F.data == "a:users")
@@ -734,9 +776,9 @@ async def cb_send_offer_target(m: Message, state: FSMContext, shop_bot: Bot):
     )
     await m.answer(f"✅ Оффер #{oid} отправлен юзеру {d['target_user']}.", reply_markup=kb_admin_panel())
 
-# --- Проверка proof ---
+# --- Проверка proof (Уведомления) ---
 @adm.callback_query(F.data.startswith("a:proof:approve:"))
-async def cb_proof_approve(cb: CallbackQuery):
+async def cb_proof_approve(cb: CallbackQuery, shop_bot: Bot):
     if not is_admin(cb.from_user.id): return
     oid = int(cb.data.split(":")[3])
     o = get_offer(oid)
@@ -746,13 +788,14 @@ async def cb_proof_approve(cb: CallbackQuery):
     set_status(oid, "paid")
     newbal = add_balance(o["user_id"], o["currency"], o["price_stars"])
     try:
-        await cb.bot.send_message(o["user_id"], f"✅ Ваш оффер #{oid} подтвержден.\nНачислено: <b>{fmt_price(o['price_stars'], o['currency'])}</b>\nБаланс: <b>{newbal:g}</b>")
-    except: pass
+        await shop_bot.send_message(o["user_id"], f"✅ Ваш оффер #{oid} подтвержден.\nНачислено: <b>{fmt_price(o['price_stars'], o['currency'])}</b>\nБаланс: <b>{newbal:g}</b>")
+    except Exception as e:
+        log.error(f"Не смог отправить уведомление: {e}")
     await cb.message.edit_reply_markup(reply_markup=None)
     await cb.answer("Начислено.")
 
 @adm.callback_query(F.data.startswith("a:proof:reject:"))
-async def cb_proof_reject(cb: CallbackQuery, state: FSMContext):
+async def cb_proof_reject(cb: CallbackQuery, shop_bot: Bot):
     if not is_admin(cb.from_user.id): return
     oid = int(cb.data.split(":")[3])
     o = get_offer(oid)
@@ -760,8 +803,9 @@ async def cb_proof_reject(cb: CallbackQuery, state: FSMContext):
     
     set_status(oid, "declined")
     try:
-        await cb.bot.send_message(o["user_id"], f"❌ Ваш оффер #{oid} отклонен. Скриншот не подтвержден.")
-    except: pass
+        await shop_bot.send_message(o["user_id"], f"❌ Ваш оффер #{oid} отклонен. Скриншот не подтвержден.")
+    except Exception as e:
+        log.error(f"Не смог отправить уведомление: {e}")
     await cb.message.edit_reply_markup(reply_markup=None)
     await cb.answer("Отклонено.")
 
